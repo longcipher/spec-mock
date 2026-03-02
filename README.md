@@ -233,6 +233,49 @@ just lint
 just test
 ```
 
+### Integration Tests (Prism Comparison)
+
+The `integration-test` command runs a side-by-side comparison suite against [Prism](https://stoplight.io/open-source/prism) to verify that spec-mock and Prism return structurally equivalent responses.
+
+**Prerequisites:**
+
+```bash
+npm install -g @stoplight/prism-cli
+```
+
+**Run:**
+
+```bash
+just integration-test
+```
+
+**Configuration via environment variables:**
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SPECMOCK_FUZZ_SEED` | `42` | Random seed for reproducible fuzz requests |
+| `SPECMOCK_FUZZ_ITERATIONS` | `5` | Number of fuzz iterations per operation |
+| `SPECMOCK_PRISM_CMD` | auto-detected | Path to Prism binary or `npx` invocation |
+
+**Example with custom seed:**
+
+```bash
+SPECMOCK_FUZZ_SEED=123 SPECMOCK_FUZZ_ITERATIONS=20 just integration-test
+```
+
+**CI (GitHub Actions example):**
+
+```yaml
+- name: Install Prism
+  run: npm install -g @stoplight/prism-cli
+- name: Run integration tests
+  run: just integration-test
+```
+
+**Known behavioral divergences:**
+
+- Wrong Content-Type handling: spec-mock returns `415 Unsupported Media Type`; Prism returns `422` or `400`. Both are valid 4xx responses. This divergence is documented and expected.
+
 ## Example Specs
 
 - OpenAPI: `docs/specs/pets.openapi.yaml`

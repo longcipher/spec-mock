@@ -328,6 +328,7 @@ mod tests {
 
     use super::{AsyncApiRuntime, WsOutcome};
 
+    #[expect(clippy::panic, reason = "test helper: panics on unexpected build failure")]
     fn build_v2_runtime() -> AsyncApiRuntime {
         let root = json!({
             "asyncapi": "2.3.0",
@@ -385,6 +386,7 @@ mod tests {
     ///
     /// After `RefResolver` inlining the `$ref` values get replaced with
     /// the full channel/message objects, so we simulate that here.
+    #[expect(clippy::panic, reason = "test helper: panics on unexpected build failure")]
     fn build_v3_runtime() -> AsyncApiRuntime {
         let chat_message_payload = json!({
             "type": "object",
@@ -449,6 +451,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::panic, reason = "test assertion: unexpected outcome variant")]
     fn explicit_channel_message_is_supported() {
         let runtime = build_v2_runtime();
         let input = json!({
@@ -462,11 +465,12 @@ mod tests {
                 assert_eq!(channel, "chat.send");
                 assert_eq!(payload, json!({"ok": true}));
             }
-            _ => panic!("expected mock outcome"),
+            WsOutcome::Error { .. } => panic!("expected mock outcome"),
         }
     }
 
     #[test]
+    #[expect(clippy::panic, reason = "test assertion: unexpected outcome variant")]
     fn auto_routing_by_schema_is_supported() {
         let runtime = build_v2_runtime();
         let input = json!({"metric": "cpu", "value": 0.95});
@@ -476,13 +480,14 @@ mod tests {
                 assert_eq!(channel, "metric.push");
                 assert_eq!(payload, json!({"accepted": true}));
             }
-            _ => panic!("expected mock outcome"),
+            WsOutcome::Error { .. } => panic!("expected mock outcome"),
         }
     }
 
     // ── AsyncAPI v3 tests ──────────────────────────────────────────────
 
     #[test]
+    #[expect(clippy::panic, reason = "test assertion: unexpected outcome variant")]
     fn v3_explicit_channel_message_returns_example() {
         let runtime = build_v3_runtime();
         let input = json!({
@@ -495,11 +500,12 @@ mod tests {
                 assert_eq!(channel, "chatChannel");
                 assert_eq!(payload, json!({"ok": true}));
             }
-            other => panic!("expected mock outcome, got {other:?}"),
+            other @ WsOutcome::Error { .. } => panic!("expected mock outcome, got {other:?}"),
         }
     }
 
     #[test]
+    #[expect(clippy::panic, reason = "test assertion: unexpected outcome variant")]
     fn v3_auto_routing_by_publish_schema() {
         let runtime = build_v3_runtime();
         let input = json!({"room": "general", "text": "hello"});
@@ -509,11 +515,12 @@ mod tests {
                 assert_eq!(channel, "chatChannel");
                 assert_eq!(payload, json!({"ok": true}));
             }
-            other => panic!("expected mock outcome, got {other:?}"),
+            other @ WsOutcome::Error { .. } => panic!("expected mock outcome, got {other:?}"),
         }
     }
 
     #[test]
+    #[expect(clippy::panic, reason = "test assertion: unexpected outcome variant")]
     fn v3_validation_rejects_bad_payload() {
         let runtime = build_v3_runtime();
         let input = json!({
@@ -525,7 +532,7 @@ mod tests {
             WsOutcome::Error { errors } => {
                 assert!(!errors.is_empty(), "expected validation errors");
             }
-            other => panic!("expected error outcome, got {other:?}"),
+            other @ WsOutcome::Mock { .. } => panic!("expected error outcome, got {other:?}"),
         }
     }
 

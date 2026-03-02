@@ -29,6 +29,10 @@ test:
 test-coverage:
   cargo tarpaulin --all-features --workspace --timeout 300
 
+# Run Prism comparison integration tests (requires Prism: npm i -g @stoplight/prism-cli)
+integration-test:
+  cargo test --test prism_comparison --features integration-test -- --nocapture --ignored
+
 # Build entire workspace
 build:
   cargo build --workspace

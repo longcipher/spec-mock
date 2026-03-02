@@ -199,6 +199,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unwrap_used, reason = "test code: header value is a valid str literal")]
     fn parses_single_prefer_code() {
         let mut headers = HeaderMap::new();
         headers.insert("prefer", "code=404".parse().unwrap());
@@ -207,6 +208,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unwrap_used, reason = "test code: header value is a valid str literal")]
     fn parses_prefer_example() {
         let mut headers = HeaderMap::new();
         headers.insert("prefer", "example=notFound".parse().unwrap());
@@ -215,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unwrap_used, reason = "test code: header value is a valid str literal")]
     fn parses_prefer_dynamic() {
         let mut headers = HeaderMap::new();
         headers.insert("prefer", "dynamic=true".parse().unwrap());
@@ -223,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unwrap_used, reason = "test code: header value is a valid str literal")]
     fn parses_combined_prefer_directives() {
         let mut headers = HeaderMap::new();
         headers.insert("prefer", "code=500, example=serverError, dynamic=true".parse().unwrap());
@@ -233,6 +237,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::unwrap_used, reason = "test code: header value is a valid str literal")]
     fn parses_accept_header() {
         let mut headers = HeaderMap::new();
         headers.insert("accept", "application/xml;q=0.5, application/json".parse().unwrap());

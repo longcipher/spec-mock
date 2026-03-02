@@ -1,0 +1,494 @@
+openapi: "3.1.0"
+info:
+  title: Spec-Mock vs Prism Comparison API
+  version: "1.0.0"
+  description: >
+    Comprehensive OpenAPI 3.1 spec used for behavioural comparison between
+    spec-mock and Prism mock server. Covers CRUD operations, polymorphism via
+    oneOf with discriminator, UUID path parameters, nested objects, RFC 7807
+    Problem Details, and multiple content types.
+
+paths:
+  # ── Pet collection ──────────────────────────────────────────────────────────
+
+  /pets:
+    get:
+      operationId: listPets
+      summary: List all pets
+      description: Returns a pageable list of pets, optionally filtered by status.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of pets to return (1–100).
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          description: Number of pets to skip before returning results (0–1000).
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 1000
+        - name: status
+          in: query
+          required: false
+          description: Filter pets by adoption status.
+          schema:
+            type: string
+            enum: [available, pending, sold]
+      responses:
+        "200":
+          description: A list of pets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Pet"
+              examples:
+                two-pets:
+                  value:
+                    - id: 1
+                      name: "Fluffy"
+                      tag: "cat"
+                      status: "available"
+                    - id: 2
+                      name: "Rex"
+                      tag: "dog"
+                      status: "pending"
+                empty-list:
+                  value: []
+        "400":
+          description: Invalid query parameters.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                invalid-limit:
+                  value:
+                    type: "https://example.com/problems/invalid-parameter"
+                    title: "Invalid query parameter"
+                    status: 400
+                    detail: "limit must be between 1 and 100"
+
+    post:
+      operationId: createPet
+      summary: Create a new pet
+      description: Creates a new pet record and returns the created resource.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPet"
+            examples:
+              create-cat:
+                value:
+                  name: "Whiskers"
+                  tag: "cat"
+                  status: "available"
+      responses:
+        "201":
+          description: Pet created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+              examples:
+                created-cat:
+                  value:
+                    id: 3
+                    name: "Whiskers"
+                    tag: "cat"
+                    status: "available"
+        "400":
+          description: Malformed request body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                missing-name:
+                  value:
+                    type: "https://example.com/problems/bad-request"
+                    title: "Bad Request"
+                    status: 400
+                    detail: "name is required"
+        "422":
+          description: Request body failed semantic validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                name-too-long:
+                  value:
+                    type: "https://example.com/problems/validation-error"
+                    title: "Validation Error"
+                    status: 422
+                    detail: "name must not exceed 50 characters"
+
+  # ── Pet resource ─────────────────────────────────────────────────────────────
+
+  /pets/{petId}:
+    parameters:
+      - name: petId
+        in: path
+        required: true
+        description: Unique numeric identifier of the pet.
+        schema:
+          type: integer
+          minimum: 1
+
+    get:
+      operationId: getPet
+      summary: Get a single pet
+      description: Returns a pet by ID. Supports both JSON and plain-text representations.
+      responses:
+        "200":
+          description: The requested pet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+              examples:
+                fluffy:
+                  value:
+                    id: 1
+                    name: "Fluffy"
+                    tag: "cat"
+                    status: "available"
+                rex:
+                  value:
+                    id: 2
+                    name: "Rex"
+                    tag: "dog"
+                    status: "pending"
+            text/plain:
+              schema:
+                type: string
+              examples:
+                fluffy-text:
+                  value: "Pet: Fluffy"
+                rex-text:
+                  value: "Pet: Rex"
+        "404":
+          description: Pet not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                not-found:
+                  value:
+                    type: "https://example.com/problems/not-found"
+                    title: "Not Found"
+                    status: 404
+                    detail: "No pet with the provided ID exists."
+
+    put:
+      operationId: updatePet
+      summary: Replace a pet
+      description: Fully replaces the pet identified by petId.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NewPet"
+            examples:
+              update-dog:
+                value:
+                  name: "Rex"
+                  tag: "dog"
+                  status: "sold"
+      responses:
+        "200":
+          description: The updated pet.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Pet"
+              examples:
+                updated-dog:
+                  value:
+                    id: 2
+                    name: "Rex"
+                    tag: "dog"
+                    status: "sold"
+        "400":
+          description: Malformed request body.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                bad-body:
+                  value:
+                    type: "https://example.com/problems/bad-request"
+                    title: "Bad Request"
+                    status: 400
+                    detail: "Request body is malformed."
+        "404":
+          description: Pet not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                not-found:
+                  value:
+                    type: "https://example.com/problems/not-found"
+                    title: "Not Found"
+                    status: 404
+                    detail: "No pet with the provided ID exists."
+
+    delete:
+      operationId: deletePet
+      summary: Delete a pet
+      description: Permanently removes the pet identified by petId.
+      responses:
+        "204":
+          description: Pet deleted; no content returned.
+        "404":
+          description: Pet not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                not-found:
+                  value:
+                    type: "https://example.com/problems/not-found"
+                    title: "Not Found"
+                    status: 404
+                    detail: "No pet with the provided ID exists."
+
+  # ── Shapes (oneOf + discriminator) ──────────────────────────────────────────
+
+  /shapes/{shapeId}:
+    get:
+      operationId: getShape
+      summary: Get a shape
+      description: >
+        Returns a geometric shape. The concrete type is indicated by the
+        discriminator field `type`; Prism and spec-mock both use it to select
+        the correct sub-schema.
+      parameters:
+        - name: shapeId
+          in: path
+          required: true
+          description: Numeric identifier of the shape.
+          schema:
+            type: integer
+      responses:
+        "200":
+          description: A shape (circle or rectangle).
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/Circle"
+                  - $ref: "#/components/schemas/Rectangle"
+                discriminator:
+                  propertyName: type
+                  mapping:
+                    circle: "#/components/schemas/Circle"
+                    rectangle: "#/components/schemas/Rectangle"
+              examples:
+                circle-example:
+                  value:
+                    type: "circle"
+                    radius: 5.0
+                rectangle-example:
+                  value:
+                    type: "rectangle"
+                    width: 10.0
+                    height: 20.0
+        "404":
+          description: Shape not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                not-found:
+                  value:
+                    type: "https://example.com/problems/not-found"
+                    title: "Not Found"
+                    status: 404
+                    detail: "No shape with the provided ID exists."
+
+  # ── Users (UUID path param, nested object, date-time) ────────────────────────
+
+  /users/{userId}:
+    get:
+      operationId: getUser
+      summary: Get a user
+      description: Returns a user record. Optionally includes profile or settings sub-objects.
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          description: UUID of the user.
+          schema:
+            type: string
+            format: uuid
+        - name: include
+          in: query
+          required: false
+          description: Sub-objects to embed in the response.
+          schema:
+            type: string
+            enum: [profile, settings, all]
+      responses:
+        "200":
+          description: The requested user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+              examples:
+                alice:
+                  value:
+                    id: "550e8400-e29b-41d4-a716-446655440000"
+                    email: "alice@example.com"
+                    name: "Alice"
+                    createdAt: "2024-01-15T08:30:00Z"
+                    profile:
+                      bio: "Cat lover and Rust enthusiast."
+                      avatar: "https://example.com/avatars/alice.png"
+                bob:
+                  value:
+                    id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+                    email: "bob@example.com"
+                    name: "Bob"
+                    createdAt: "2024-03-22T14:00:00Z"
+        "404":
+          description: User not found.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+              examples:
+                not-found:
+                  value:
+                    type: "https://example.com/problems/not-found"
+                    title: "Not Found"
+                    status: 404
+                    detail: "No user with the provided ID exists."
+
+# ── Reusable components ──────────────────────────────────────────────────────
+
+components:
+  schemas:
+
+    # ── Pet ─────────────────────────────────────────────────────────────────
+    Pet:
+      type: object
+      required: [id, name, status]
+      properties:
+        id:
+          type: integer
+          minimum: 1
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+        tag:
+          type: string
+        status:
+          type: string
+          enum: [available, pending, sold]
+
+    NewPet:
+      type: object
+      required: [name, status]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 50
+        tag:
+          type: string
+        status:
+          type: string
+          enum: [available, pending, sold]
+
+    # ── Problem Details (RFC 7807) ──────────────────────────────────────────
+    ProblemDetails:
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri
+
+    # ── Shapes ──────────────────────────────────────────────────────────────
+    Circle:
+      type: object
+      required: [type, radius]
+      properties:
+        type:
+          type: string
+          enum: [circle]
+        radius:
+          type: number
+          minimum: 0
+
+    Rectangle:
+      type: object
+      required: [type, width, height]
+      properties:
+        type:
+          type: string
+          enum: [rectangle]
+        width:
+          type: number
+          minimum: 0
+        height:
+          type: number
+          minimum: 0
+
+    # ── User ────────────────────────────────────────────────────────────────
+    UserProfile:
+      type: object
+      required: [bio, avatar]
+      properties:
+        bio:
+          type: string
+        avatar:
+          type: string
+          format: uri
+
+    User:
+      type: object
+      required: [id, email, name, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        profile:
+          $ref: "#/components/schemas/UserProfile"

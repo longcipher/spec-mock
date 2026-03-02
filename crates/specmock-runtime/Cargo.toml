@@ -47,10 +47,17 @@ tower = { version = "0.5", features = ["util"] }
 tracing = "0.1.44"
 url = "2.5.8"
 
+[features]
+integration-test = []
+
 [lints]
 workspace = true
 
 [dev-dependencies]
+hpx = "2.3.1"
+rand = "0.10.0"
+rand_chacha = "0.10.0"
+serde_yml = "0.0.12"
 tokio-tungstenite = "0.28.0"
 tonic = { version = "0.14", default-features = false, features = [
     "codegen",
