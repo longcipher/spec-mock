@@ -1,0 +1,22 @@
+[package]
+name = "spec-mock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap = { version = "4.5.60", features = ["derive"] }
+eyre = "0.6.12"
+specmock-core = { version = "0.1.0", path = "../../crates/specmock-core" }
+specmock-sdk = { version = "0.1.0", path = "../../crates/specmock-sdk" }
+tokio = { version = "1.49.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+] }
+tracing = "0.1.44"
+tracing-subscriber = "0.3.22"
+
+[lints]
+workspace = true

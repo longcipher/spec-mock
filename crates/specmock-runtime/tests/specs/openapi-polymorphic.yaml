@@ -1,0 +1,66 @@
+openapi: 3.1.0
+info:
+  title: Polymorphic Shapes API
+  version: "1.0.0"
+paths:
+  /shapes:
+    get:
+      operationId: listShapes
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Shape"
+  /shapes/{id}:
+    get:
+      operationId: getShape
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Shape"
+components:
+  schemas:
+    Shape:
+      oneOf:
+        - $ref: "#/components/schemas/Circle"
+        - $ref: "#/components/schemas/Rectangle"
+      discriminator:
+        propertyName: shapeType
+        mapping:
+          circle: "#/components/schemas/Circle"
+          rectangle: "#/components/schemas/Rectangle"
+    Circle:
+      type: object
+      required: [shapeType, radius]
+      properties:
+        shapeType:
+          type: string
+        radius:
+          type: number
+          minimum: 0
+    Rectangle:
+      type: object
+      required: [shapeType, width, height]
+      properties:
+        shapeType:
+          type: string
+        width:
+          type: number
+          minimum: 0
+        height:
+          type: number
+          minimum: 0

@@ -1,0 +1,21 @@
+asyncapi: 2.6.0
+info:
+  title: Chat Stream
+  version: "1.0.0"
+channels:
+  chat.send:
+    publish:
+      message:
+        payload:
+          type: object
+          required: [room, text]
+          properties:
+            room:
+              type: string
+            text:
+              type: string
+    subscribe:
+      message:
+        example:
+          ok: true
+          channel: chat.send

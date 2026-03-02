@@ -1,0 +1,38 @@
+asyncapi: "3.0.0"
+info:
+  title: Chat v3
+  version: "1.0.0"
+channels:
+  chatChannel:
+    messages:
+      chatMessage:
+        payload:
+          type: object
+          required: [room, text]
+          properties:
+            room:
+              type: string
+            text:
+              type: string
+      chatReply:
+        payload:
+          type: object
+          properties:
+            ok:
+              type: boolean
+        examples:
+          - payload:
+              ok: true
+operations:
+  sendChat:
+    action: send
+    channel:
+      $ref: "#/channels/chatChannel"
+    messages:
+      - $ref: "#/channels/chatChannel/messages/chatMessage"
+  receiveReply:
+    action: receive
+    channel:
+      $ref: "#/channels/chatChannel"
+    messages:
+      - $ref: "#/channels/chatChannel/messages/chatReply"

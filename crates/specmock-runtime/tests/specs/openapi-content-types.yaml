@@ -1,0 +1,48 @@
+openapi: 3.1.0
+info:
+  title: Multi Content-Type API
+  version: "1.0.0"
+paths:
+  /report:
+    get:
+      operationId: getReport
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [title, data]
+                properties:
+                  title:
+                    type: string
+                    minLength: 1
+                  data:
+                    type: array
+                    items:
+                      type: integer
+              example:
+                title: "Monthly Report"
+                data: [10, 20, 30]
+            text/plain:
+              schema:
+                type: string
+              example: "Monthly Report: 10,20,30"
+  /health:
+    get:
+      operationId: healthCheck
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: ["ok", "degraded"]
+              example:
+                status: ok

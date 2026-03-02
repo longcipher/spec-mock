@@ -1,0 +1,47 @@
+openapi: 3.1.0
+info:
+  title: Callbacks API
+  version: "1.0.0"
+paths:
+  /subscribe:
+    post:
+      operationId: subscribe
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [callbackUrl]
+              properties:
+                callbackUrl:
+                  type: string
+      responses:
+        "201":
+          description: Subscription created
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: integer
+                    minimum: 1
+      callbacks:
+        onEvent:
+          '{$request.body#/callbackUrl}/notify':
+            post:
+              requestBody:
+                content:
+                  application/json:
+                    schema:
+                      type: object
+                      required: [event]
+                      properties:
+                        event:
+                          type: string
+                          minLength: 1
+              responses:
+                "200":
+                  description: Callback acknowledged

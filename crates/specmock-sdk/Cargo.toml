@@ -1,0 +1,25 @@
+[package]
+name = "specmock-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+specmock-core = { version = "0.1.0", path = "../specmock-core" }
+specmock-runtime = { version = "0.1.0", path = "../specmock-runtime" }
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "sync",
+    "process",
+    "time",
+] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+hpx = "2.3.1"

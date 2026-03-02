@@ -1,0 +1,65 @@
+openapi: 3.1.0
+info:
+  title: Negotiate Pets API
+  version: "1.0.0"
+paths:
+  /pets/{id}:
+    get:
+      operationId: getPet
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, name]
+                properties:
+                  id:
+                    type: integer
+                    minimum: 1
+                  name:
+                    type: string
+                    minLength: 1
+              examples:
+                fluffy:
+                  summary: A fluffy pet
+                  value:
+                    id: 42
+                    name: Fluffy
+                whiskers:
+                  summary: A whiskered pet
+                  value:
+                    id: 7
+                    name: Whiskers
+        "404":
+          description: not found
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              example:
+                error: pet not found
+        "500":
+          description: server error
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+              example:
+                error: internal server error
