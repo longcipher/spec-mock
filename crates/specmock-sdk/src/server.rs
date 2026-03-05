@@ -1,9 +1,10 @@
 //! SDK server builder and handles.
 
 use std::{
+    io::Read,
     net::SocketAddr,
     path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
+    process::{Child, Command, ExitStatus, Stdio},
 };
 
 use specmock_core::MockMode;
@@ -91,14 +92,18 @@ impl ProcessMockServer {
 
     /// Kill spawned process.
     pub fn shutdown(&mut self) -> Result<(), SdkError> {
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
         self.child.kill()?;
+        let _status = self.child.wait()?;
         Ok(())
     }
 }
 
 impl Drop for ProcessMockServer {
     fn drop(&mut self) {
-        let _ignored = self.child.kill();
+        let _ignored = self.shutdown();
     }
 }
 
@@ -185,12 +190,8 @@ impl MockServerBuilder {
         mut self,
         bin_path: &Path,
     ) -> Result<ProcessMockServer, SdkError> {
-        if self.config.http_addr.port() == 0 {
-            self.config.http_addr = SocketAddr::from(([127, 0, 0, 1], 4010));
-        }
-        if self.config.grpc_addr.port() == 0 {
-            self.config.grpc_addr = SocketAddr::from(([127, 0, 0, 1], 5010));
-        }
+        self.config.http_addr = resolve_process_bind_addr(self.config.http_addr)?;
+        self.config.grpc_addr = resolve_process_bind_addr(self.config.grpc_addr)?;
 
         let mut command = Command::new(bin_path);
         command
@@ -208,7 +209,7 @@ impl MockServerBuilder {
             })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         if let Some(path) = &self.config.openapi_spec {
             command.arg("--openapi").arg(path);
@@ -226,12 +227,12 @@ impl MockServerBuilder {
 
         let mut child = command.spawn()?;
 
-        if let Err(error) = wait_for_tcp_ready(self.config.http_addr, "http").await {
+        if let Err(error) = wait_for_tcp_ready(&mut child, self.config.http_addr, "http").await {
             let _ignored = child.kill();
             return Err(error);
         }
         if self.config.proto_spec.is_some() &&
-            let Err(error) = wait_for_tcp_ready(self.config.grpc_addr, "grpc").await
+            let Err(error) = wait_for_tcp_ready(&mut child, self.config.grpc_addr, "grpc").await
         {
             let _ignored = child.kill();
             return Err(error);
@@ -245,10 +246,50 @@ impl MockServerBuilder {
     }
 }
 
-async fn wait_for_tcp_ready(addr: SocketAddr, listener_name: &str) -> Result<(), SdkError> {
+fn resolve_process_bind_addr(addr: SocketAddr) -> Result<SocketAddr, SdkError> {
+    if addr.port() != 0 {
+        return Ok(addr);
+    }
+    let listener = std::net::TcpListener::bind(SocketAddr::new(addr.ip(), 0))?;
+    let bound = listener.local_addr()?;
+    drop(listener);
+    Ok(bound)
+}
+
+fn process_start_error(
+    child: &mut Child,
+    listener_name: &str,
+    addr: SocketAddr,
+    status: ExitStatus,
+) -> SdkError {
+    let stderr = child.stderr.as_mut().map_or_else(String::new, |stderr| {
+        let mut out = String::new();
+        let _ignored = stderr.read_to_string(&mut out);
+        out
+    });
+    let detail = if stderr.trim().is_empty() {
+        format!("process exited with status {status}")
+    } else {
+        format!("process exited with status {status}: {}", stderr.trim())
+    };
+
+    SdkError::Io(std::io::Error::other(format!(
+        "spec-mock process failed before {listener_name} listener became ready on {addr}: {detail}"
+    )))
+}
+
+async fn wait_for_tcp_ready(
+    child: &mut Child,
+    addr: SocketAddr,
+    listener_name: &str,
+) -> Result<(), SdkError> {
     let deadline = Instant::now() + PROCESS_READY_TIMEOUT;
 
     loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(process_start_error(child, listener_name, addr, status));
+        }
+
         match tokio::net::TcpStream::connect(addr).await {
             Ok(stream) => {
                 drop(stream);

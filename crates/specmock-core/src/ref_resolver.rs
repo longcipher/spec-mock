@@ -5,7 +5,7 @@
 //! currently supported and will produce an error.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
 };
 
@@ -16,6 +16,7 @@ use crate::error::SpecMockCoreError;
 
 /// Default maximum recursion depth for `$ref` resolution.
 const DEFAULT_MAX_DEPTH: usize = 64;
+const DEFAULT_EXTERNAL_DOC_CACHE_LIMIT: usize = 128;
 
 /// A fully-resolved document where all `$ref` pointers have been inlined.
 #[derive(Debug, Clone)]
@@ -32,21 +33,64 @@ pub struct ResolvedDocument {
 pub struct RefResolver {
     /// Base directory for resolving relative file refs.
     base_dir: PathBuf,
+    /// Canonicalized root directories that file refs must stay within.
+    allowed_roots: Vec<PathBuf>,
     /// Cache of already-loaded external documents keyed by canonical path.
     cache: HashMap<String, Value>,
+    /// FIFO insertion order of cache keys for bounded-size eviction.
+    cache_order: VecDeque<String>,
     /// Maximum resolution depth to prevent cycles.
     max_depth: usize,
+    /// Maximum number of external docs retained in memory.
+    external_cache_limit: usize,
 }
 
 impl RefResolver {
     /// Create a new resolver rooted at `base_dir`.
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir, cache: HashMap::new(), max_depth: DEFAULT_MAX_DEPTH }
+        let allowed_root = std::fs::canonicalize(&base_dir).unwrap_or_else(|_| base_dir.clone());
+        Self {
+            base_dir,
+            allowed_roots: vec![allowed_root],
+            cache: HashMap::new(),
+            cache_order: VecDeque::new(),
+            max_depth: DEFAULT_MAX_DEPTH,
+            external_cache_limit: DEFAULT_EXTERNAL_DOC_CACHE_LIMIT,
+        }
     }
 
     /// Override the default cycle-detection depth limit.
     pub const fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
+        self
+    }
+
+    /// Add an additional allowed root for file-relative refs.
+    #[must_use]
+    pub fn with_allowed_root(mut self, root: PathBuf) -> Self {
+        let canonical = std::fs::canonicalize(&root).unwrap_or(root);
+        if !self.allowed_roots.iter().any(|existing| existing == &canonical) {
+            self.allowed_roots.push(canonical);
+        }
+        self
+    }
+
+    /// Add multiple allowed roots for file-relative refs.
+    #[must_use]
+    pub fn with_allowed_roots<I>(mut self, roots: I) -> Self
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        for root in roots {
+            self = self.with_allowed_root(root);
+        }
+        self
+    }
+
+    /// Set maximum number of external docs cached by this resolver.
+    #[must_use]
+    pub const fn with_external_cache_limit(mut self, max_entries: usize) -> Self {
+        self.external_cache_limit = if max_entries == 0 { 1 } else { max_entries };
         self
     }
 
@@ -177,12 +221,26 @@ impl RefResolver {
                     file_path.display()
                 ))
             })?;
+            if !self.allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+                let allowed = self
+                    .allowed_roots
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(SpecMockCoreError::Ref(format!(
+                    "file ref points outside allowed roots [{allowed}]: {}",
+                    canonical.display()
+                )));
+            }
             let cache_key = canonical.to_string_lossy().to_string();
 
             // Load into cache if not present.
             if !self.cache.contains_key(&cache_key) {
+                self.evict_external_cache_if_needed();
                 let doc = load_file(&canonical)?;
                 self.cache.insert(cache_key.clone(), doc);
+                self.cache_order.push_back(cache_key.clone());
             }
 
             let external_doc = self
@@ -209,6 +267,21 @@ impl RefResolver {
 
             Ok(resolved)
         }
+    }
+
+    fn evict_external_cache_if_needed(&mut self) {
+        while self.cache_order.len() >= self.external_cache_limit {
+            if let Some(evicted_key) = self.cache_order.pop_front() {
+                self.cache.remove(&evicted_key);
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn external_cache_size_for_tests(&self) -> usize {
+        self.cache.len()
     }
 }
 
@@ -578,6 +651,110 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let err = resolver.resolve(&main_file).expect_err("should fail");
         assert!(err.to_string().contains("URL-based"), "error: {err}");
+    }
+
+    #[test]
+    fn external_file_ref_outside_base_dir_returns_error() {
+        let root = TempDir::new().expect("root tmpdir");
+        let outside = TempDir::new().expect("outside tmpdir");
+
+        let outside_schema = json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                }
+            }
+        });
+        let outside_path = write_json(outside.path(), "pet.json", &outside_schema);
+
+        let main_doc = json!({
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "$ref": format!("{}#/Pet", outside_path.display())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let main_file = write_json(root.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(root.path().to_path_buf());
+        let err = resolver.resolve(&main_file).expect_err("should reject refs outside base dir");
+        assert!(err.to_string().contains("outside allowed roots"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn additional_allowed_root_allows_external_file_ref() {
+        let root = TempDir::new().expect("root tmpdir");
+        let outside = TempDir::new().expect("outside tmpdir");
+
+        let outside_schema = json!({
+            "Pet": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"}
+                }
+            }
+        });
+        let outside_path = write_json(outside.path(), "pet.json", &outside_schema);
+
+        let main_doc = json!({
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "schema": {
+                                    "$ref": format!("{}#/Pet", outside_path.display())
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let main_file = write_json(root.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(root.path().to_path_buf())
+            .with_allowed_root(outside.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("should allow external ref");
+        assert_eq!(
+            resolved.root["paths"]["/pets"]["get"]["responses"]["200"]["schema"]["type"],
+            "object"
+        );
+    }
+
+    #[test]
+    fn external_doc_cache_respects_limit() {
+        let root = TempDir::new().expect("root tmpdir");
+
+        write_json(root.path(), "schemas/a.json", &json!({"A":{"type":"string"}}));
+        write_json(root.path(), "schemas/b.json", &json!({"B":{"type":"integer"}}));
+        write_json(root.path(), "schemas/c.json", &json!({"C":{"type":"boolean"}}));
+
+        let main_a =
+            write_json(root.path(), "a.json", &json!({"schema":{"$ref":"./schemas/a.json#/A"}}));
+        let main_b =
+            write_json(root.path(), "b.json", &json!({"schema":{"$ref":"./schemas/b.json#/B"}}));
+        let main_c =
+            write_json(root.path(), "c.json", &json!({"schema":{"$ref":"./schemas/c.json#/C"}}));
+
+        let mut resolver = RefResolver::new(root.path().to_path_buf()).with_external_cache_limit(2);
+        let _ra = resolver.resolve(&main_a).expect("resolve a");
+        let _rb = resolver.resolve(&main_b).expect("resolve b");
+        let _rc = resolver.resolve(&main_c).expect("resolve c");
+
+        assert!(
+            resolver.external_cache_size_for_tests() <= 2,
+            "external doc cache should not exceed configured limit"
+        );
     }
 
     // ── split_ref unit tests ───────────────────────────────────────────

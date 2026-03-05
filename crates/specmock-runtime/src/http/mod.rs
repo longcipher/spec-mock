@@ -39,7 +39,7 @@ pub struct HttpRuntime {
     openapi: Option<OpenApiRuntime>,
     asyncapi: Option<AsyncApiRuntime>,
     mode: MockMode,
-    upstream: Option<String>,
+    upstream: Option<url::Url>,
     seed: u64,
     ws_path: String,
     /// Map from per-channel WS path to channel name.
@@ -79,11 +79,21 @@ impl HttpRuntime {
         let asyncapi =
             config.asyncapi_spec.as_deref().map(AsyncApiRuntime::from_path).transpose()?;
 
-        if openapi.is_none() && asyncapi.is_none() {
+        if config.mode == MockMode::Proxy && config.upstream.is_none() {
             return Err(RuntimeError::Config(
-                "http runtime requires openapi_spec or asyncapi_spec".to_owned(),
+                "proxy mode requires upstream base URL (--upstream)".to_owned(),
             ));
         }
+
+        let upstream = config
+            .upstream
+            .as_ref()
+            .map(|raw| {
+                raw.parse::<url::Url>().map_err(|error| {
+                    RuntimeError::Config(format!("invalid upstream URL '{raw}': {error}"))
+                })
+            })
+            .transpose()?;
 
         let ws_base = config.ws_path.trim_end_matches('/');
         let ws_channel_paths: HashMap<String, String> = asyncapi
@@ -97,7 +107,7 @@ impl HttpRuntime {
             openapi,
             asyncapi,
             mode: config.mode,
-            upstream: config.upstream.clone(),
+            upstream,
             seed: config.seed,
             ws_path: config.ws_path.clone(),
             ws_channel_paths,
@@ -253,11 +263,14 @@ async fn http_fallback_handler(
     }
 
     let query_params = parse_query(uri.query());
-    let request_body_json = parse_optional_json_body(
+    let request_body_json = match parse_optional_json_body(
         &headers,
         &body_bytes,
         matched.operation.request_body_schema.is_some(),
-    );
+    ) {
+        Ok(value) => value,
+        Err(issue) => return error_response(StatusCode::BAD_REQUEST, vec![issue]),
+    };
 
     let validation_issues =
         validate_http_request(&matched, &query_params, &headers, request_body_json.as_ref());
@@ -360,7 +373,7 @@ async fn fire_callback(
 
 async fn proxy_request(
     runtime: &HttpRuntime,
-    upstream: &str,
+    upstream: &url::Url,
     method: &Method,
     uri: &axum::http::Uri,
     headers: &HeaderMap,
@@ -369,7 +382,7 @@ async fn proxy_request(
 ) -> Response {
     let target_url = format!(
         "{}{}{}",
-        upstream.trim_end_matches('/'),
+        upstream.as_str().trim_end_matches('/'),
         uri.path(),
         uri.query().map_or_else(String::new, |query| format!("?{query}"))
     );
@@ -386,11 +399,12 @@ async fn proxy_request(
 
     // Set Host header from upstream URL so the proxy target receives the
     // correct virtual-host identity.
-    if let Ok(parsed) = upstream.parse::<url::Url>() &&
-        let Some(host) = parsed.host_str()
-    {
-        let host_value =
-            if let Some(port) = parsed.port() { format!("{host}:{port}") } else { host.to_owned() };
+    if let Some(host) = upstream.host_str() {
+        let host_value = if let Some(port) = upstream.port() {
+            format!("{host}:{port}")
+        } else {
+            host.to_owned()
+        };
         request_builder = request_builder.header("Host", host_value);
     }
 
@@ -474,14 +488,19 @@ fn parse_optional_json_body(
     headers: &HeaderMap,
     bytes: &[u8],
     should_parse: bool,
-) -> Option<Value> {
+) -> Result<Option<Value>, ValidationIssue> {
     if !should_parse || bytes.is_empty() {
-        return None;
+        return Ok(None);
     }
     if !header_is_json(headers) {
-        return None;
+        return Ok(None);
     }
-    serde_json::from_slice::<Value>(bytes).ok()
+    serde_json::from_slice::<Value>(bytes).map(Some).map_err(|error| ValidationIssue {
+        instance_pointer: "/body".to_owned(),
+        schema_pointer: "#/requestBody".to_owned(),
+        keyword: "json".to_owned(),
+        message: format!("invalid json request body: {error}"),
+    })
 }
 
 fn parse_query(query: Option<&str>) -> HashMap<String, Vec<String>> {

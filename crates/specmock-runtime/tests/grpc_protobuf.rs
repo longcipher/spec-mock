@@ -54,10 +54,6 @@ impl<U: Message + Default> Decoder for TestProstDecoder<U> {
     }
 }
 
-fn asyncapi_spec_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("specs").join("asyncapi-chat.yaml")
-}
-
 fn proto_spec_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("specs").join("greeter.proto")
 }
@@ -86,7 +82,6 @@ async fn boot_server(
     proto_path: PathBuf,
 ) -> Result<(SocketAddr, specmock_runtime::RunningServer), Box<dyn std::error::Error>> {
     let config = ServerConfig {
-        asyncapi_spec: Some(asyncapi_spec_path()),
         proto_spec: Some(proto_path),
         mode: MockMode::Mock,
         http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),

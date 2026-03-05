@@ -484,6 +484,40 @@ async fn wrong_content_type_returns_415_unsupported_media_type()
 }
 
 #[tokio::test]
+async fn malformed_json_body_returns_400_bad_request() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_body_limit_spec_path()),
+        mode: MockMode::Mock,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    let response = hpx::Client::new()
+        .post(format!("http://{}/items", server.http_addr))
+        .header("Content-Type", "application/json")
+        .body(r#"{"name":"oops""#)
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 400, "expected 400 Bad Request for malformed JSON body");
+
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await?)?;
+    assert_eq!(body.get("status").and_then(serde_json::Value::as_u64), Some(400));
+    assert_eq!(body.pointer("/errors/0/keyword").and_then(serde_json::Value::as_str), Some("json"));
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn correct_content_type_post_returns_success() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {
         openapi_spec: Some(openapi_body_limit_spec_path()),
@@ -541,6 +575,26 @@ async fn empty_body_skips_content_type_check() -> Result<(), Box<dyn std::error:
 
     server.shutdown().await;
     Ok(())
+}
+
+#[tokio::test]
+async fn proxy_mode_without_upstream_returns_config_error() {
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_spec_path()),
+        mode: MockMode::Proxy,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let result = start(config).await;
+    assert!(
+        matches!(
+            result,
+            Err(RuntimeError::Config(ref message))
+                if message.contains("proxy mode requires upstream")
+        ),
+        "expected proxy config error, got {result:?}"
+    );
 }
 
 fn openapi_callbacks_spec_path() -> PathBuf {

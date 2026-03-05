@@ -156,9 +156,14 @@ impl OpenApiRuntime {
                 };
 
                 let mut parameters = inherited_parameters.clone();
-                let mut operation_params =
+                let operation_params =
                     parse_parameters(operation_object.get("parameters"), version)?;
-                parameters.append(&mut operation_params);
+                for parameter in operation_params {
+                    parameters.retain(|existing| {
+                        existing.location != parameter.location || existing.name != parameter.name
+                    });
+                    parameters.push(parameter);
+                }
 
                 let request_body = parse_request_body(operation_object, version)?;
                 let responses = parse_responses(operation_object, version)?;
@@ -751,4 +756,75 @@ fn parse_status_code(status: &str) -> u16 {
         return 200;
     }
     status.parse::<u16>().unwrap_or(200)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use http::{HeaderMap, Method};
+    use serde_json::json;
+
+    use super::OpenApiRuntime;
+
+    #[test]
+    fn operation_level_parameter_overrides_path_level_parameter() {
+        let root = json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets/{id}": {
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": true,
+                            "schema": {"type": "integer"}
+                        }
+                    ],
+                    "get": {
+                        "parameters": [
+                            {
+                                "name": "id",
+                                "in": "path",
+                                "required": true,
+                                "schema": {
+                                    "type": "string",
+                                    "pattern": "^[a-z]+$"
+                                }
+                            }
+                        ],
+                        "responses": {
+                            "200": {
+                                "description": "ok"
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let runtime = OpenApiRuntime::from_resolved(root).expect("runtime should parse");
+
+        let alpha = runtime
+            .match_operation(&Method::GET, "/pets/abc")
+            .expect("operation should match alpha path");
+        let alpha_issues = alpha.operation.validate_request(
+            &alpha.path_params,
+            &HashMap::new(),
+            &HeaderMap::new(),
+            None,
+        );
+        assert!(alpha_issues.is_empty(), "operation-level schema should accept alpha id");
+
+        let numeric = runtime
+            .match_operation(&Method::GET, "/pets/123")
+            .expect("operation should match numeric path");
+        let numeric_issues = numeric.operation.validate_request(
+            &numeric.path_params,
+            &HashMap::new(),
+            &HeaderMap::new(),
+            None,
+        );
+        assert!(!numeric_issues.is_empty(), "operation-level pattern should reject numeric id");
+    }
 }

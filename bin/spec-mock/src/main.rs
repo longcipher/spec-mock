@@ -38,7 +38,7 @@ struct ServeArgs {
     #[arg(long, value_enum, default_value = "mock")]
     mode: ModeArg,
     /// Proxy upstream base URL.
-    #[arg(long)]
+    #[arg(long, required_if_eq("mode", "proxy"))]
     upstream: Option<String>,
     /// Deterministic data seed.
     #[arg(long, default_value_t = 42)]

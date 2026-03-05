@@ -101,6 +101,16 @@ pub enum RuntimeError {
 
 /// Start protocol runtimes.
 pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> {
+    if config.openapi_spec.is_none() &&
+        config.asyncapi_spec.is_none() &&
+        config.proto_spec.is_none()
+    {
+        return Err(RuntimeError::Config(
+            "at least one spec must be provided: openapi_spec, asyncapi_spec, or proto_spec"
+                .to_owned(),
+        ));
+    }
+
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let shared_shutdown = Arc::new(tokio::sync::Notify::new());
 
