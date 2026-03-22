@@ -2,36 +2,34 @@
 
 pub mod negotiate;
 pub mod openapi;
+pub mod proxy;
 pub mod router;
+pub mod ws_handler;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
     Json, Router,
     body::{Body, to_bytes},
-    extract::{
-        Request, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
+    extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
     serve,
 };
-use futures_util::StreamExt;
 use negotiate::PreferDirectives;
 use openapi::{MatchedOperation, OpenApiRuntime};
 use serde_json::Value;
 use specmock_core::{
     MockMode, PROBLEM_JSON_CONTENT_TYPE, ProblemDetails, ValidationIssue,
-    faker::generate_json_value, validate::validate_instance,
+    faker::generate_json_value,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
-use crate::{
-    RuntimeError,
-    ws::{AsyncApiRuntime, WsOutcome},
-};
+use crate::{RuntimeError, ws::AsyncApiRuntime};
+
+/// Hash multiplier for path and method hashing.
+const HASH_MULTIPLIER: u64 = 131;
 
 /// Shared runtime state.
 #[derive(Clone)]
@@ -127,9 +125,9 @@ pub async fn spawn_http_server(
     let bound = listener.local_addr()?;
     let state = Arc::new(runtime);
 
-    let mut app = Router::new().route(&state.ws_path, get(ws_upgrade_handler));
+    let mut app = Router::new().route(&state.ws_path, get(ws_handler::ws_upgrade_handler));
     for ws_channel_path in state.ws_channel_paths.keys() {
-        app = app.route(ws_channel_path, get(ws_upgrade_handler));
+        app = app.route(ws_channel_path, get(ws_handler::ws_upgrade_handler));
     }
     let app = app.fallback(http_fallback_handler).with_state(Arc::clone(&state));
 
@@ -142,86 +140,6 @@ pub async fn spawn_http_server(
     });
 
     Ok((bound, task))
-}
-
-async fn ws_upgrade_handler(
-    ws: WebSocketUpgrade,
-    State(runtime): State<Arc<HttpRuntime>>,
-    uri: axum::http::Uri,
-) -> impl IntoResponse {
-    if runtime.asyncapi.is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error":"asyncapi runtime is not configured"})),
-        )
-            .into_response();
-    }
-
-    let pinned_channel = runtime.resolve_ws_channel(uri.path());
-    ws.on_upgrade(move |socket| ws_socket_loop(socket, runtime, pinned_channel)).into_response()
-}
-
-async fn ws_socket_loop(
-    mut socket: WebSocket,
-    runtime: Arc<HttpRuntime>,
-    pinned_channel: Option<String>,
-) {
-    while let Some(next_item) = socket.next().await {
-        let Ok(message) = next_item else {
-            break;
-        };
-
-        let Message::Text(text) = message else {
-            continue;
-        };
-
-        let outcome = runtime.asyncapi.as_ref().map_or_else(
-            || WsOutcome::Error {
-                errors: vec![ValidationIssue {
-                    instance_pointer: "/".to_owned(),
-                    schema_pointer: "#".to_owned(),
-                    keyword: "runtime".to_owned(),
-                    message: "asyncapi runtime is not configured".to_owned(),
-                }],
-            },
-            |asyncapi| {
-                if let Some(channel) = &pinned_channel {
-                    // Wrap raw payload in an explicit envelope for the pinned channel.
-                    let envelope = match serde_json::from_str::<Value>(&text) {
-                        Ok(payload) => serde_json::json!({"channel": channel, "payload": payload}),
-                        Err(_error) => {
-                            // If the raw text is not valid JSON, pass it through and let
-                            // handle_message produce the parse-error outcome.
-                            return asyncapi.handle_message(&text, runtime.seed);
-                        }
-                    };
-                    asyncapi.handle_message(&envelope.to_string(), runtime.seed)
-                } else {
-                    asyncapi.handle_message(&text, runtime.seed)
-                }
-            },
-        );
-
-        let encoded = match serde_json::to_string(&outcome) {
-            Ok(value) => value,
-            Err(error) => {
-                let fallback = serde_json::json!({
-                    "type": "error",
-                    "errors": [{
-                        "instance_pointer": "/",
-                        "schema_pointer": "#",
-                        "keyword": "json",
-                        "message": format!("failed to encode ws response: {error}")
-                    }]
-                });
-                fallback.to_string()
-            }
-        };
-
-        if socket.send(Message::Text(encoded.into())).await.is_err() {
-            break;
-        }
-    }
 }
 
 async fn http_fallback_handler(
@@ -281,7 +199,7 @@ async fn http_fallback_handler(
     if runtime.mode == MockMode::Proxy &&
         let Some(upstream) = &runtime.upstream
     {
-        return proxy_request(
+        return proxy::proxy_request(
             runtime.as_ref(),
             upstream,
             &method,
@@ -371,119 +289,6 @@ async fn fire_callback(
     }
 }
 
-async fn proxy_request(
-    runtime: &HttpRuntime,
-    upstream: &url::Url,
-    method: &Method,
-    uri: &axum::http::Uri,
-    headers: &HeaderMap,
-    body_bytes: &[u8],
-    matched: &MatchedOperation<'_>,
-) -> Response {
-    let target_url = format!(
-        "{}{}{}",
-        upstream.as_str().trim_end_matches('/'),
-        uri.path(),
-        uri.query().map_or_else(String::new, |query| format!("?{query}"))
-    );
-
-    let mut request_builder =
-        runtime.client.request(method.clone(), target_url).body(body_bytes.to_vec());
-    for (name, value) in headers {
-        let lower = name.as_str().to_ascii_lowercase();
-        if lower == "host" || lower == "content-length" {
-            continue;
-        }
-        request_builder = request_builder.header(name, value);
-    }
-
-    // Set Host header from upstream URL so the proxy target receives the
-    // correct virtual-host identity.
-    if let Some(host) = upstream.host_str() {
-        let host_value = if let Some(port) = upstream.port() {
-            format!("{host}:{port}")
-        } else {
-            host.to_owned()
-        };
-        request_builder = request_builder.header("Host", host_value);
-    }
-
-    let upstream_response = match request_builder.send().await {
-        Ok(response) => response,
-        Err(error) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                vec![ValidationIssue {
-                    instance_pointer: "/proxy".to_owned(),
-                    schema_pointer: "#".to_owned(),
-                    keyword: "proxy".to_owned(),
-                    message: format!("upstream request failed: {error}"),
-                }],
-            );
-        }
-    };
-
-    let status = upstream_response.status();
-    let response_headers = upstream_response.headers().clone();
-    let response_bytes = match upstream_response.bytes().await {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                vec![ValidationIssue {
-                    instance_pointer: "/response/body".to_owned(),
-                    schema_pointer: "#".to_owned(),
-                    keyword: "proxy".to_owned(),
-                    message: format!("failed to read upstream response body: {error}"),
-                }],
-            );
-        }
-    };
-
-    if let Some(schema) = matched.operation.response_schema_for_status(status.as_u16()) &&
-        header_is_json(&response_headers)
-    {
-        match serde_json::from_slice::<Value>(&response_bytes) {
-            Ok(response_json) => match validate_instance(schema, &response_json) {
-                Ok(issues) if !issues.is_empty() => {
-                    return error_response(StatusCode::BAD_GATEWAY, issues);
-                }
-                Ok(_issues) => {}
-                Err(error) => {
-                    return error_response(
-                        StatusCode::BAD_GATEWAY,
-                        vec![ValidationIssue {
-                            instance_pointer: "/response".to_owned(),
-                            schema_pointer: "#/responses".to_owned(),
-                            keyword: "schema".to_owned(),
-                            message: error.to_string(),
-                        }],
-                    );
-                }
-            },
-            Err(error) => {
-                return error_response(
-                    StatusCode::BAD_GATEWAY,
-                    vec![ValidationIssue {
-                        instance_pointer: "/response/body".to_owned(),
-                        schema_pointer: "#/responses".to_owned(),
-                        keyword: "json".to_owned(),
-                        message: format!("upstream response is not valid json: {error}"),
-                    }],
-                );
-            }
-        }
-    }
-
-    let mut builder = Response::builder().status(status);
-    if let Some(target_headers) = builder.headers_mut() {
-        for (name, value) in &response_headers {
-            target_headers.append(name, value.clone());
-        }
-    }
-    builder.body(Body::from(response_bytes)).unwrap_or_else(|_error| Response::new(Body::empty()))
-}
-
 fn parse_optional_json_body(
     headers: &HeaderMap,
     bytes: &[u8],
@@ -543,6 +348,8 @@ fn hash_path_and_method(path: &str, method: &Method) -> u64 {
     let method_hash = method
         .as_str()
         .bytes()
-        .fold(0_u64, |acc, byte| acc.wrapping_mul(131).wrapping_add(u64::from(byte)));
-    path.bytes().fold(method_hash, |acc, byte| acc.wrapping_mul(131).wrapping_add(u64::from(byte)))
+        .fold(0_u64, |acc, byte| acc.wrapping_mul(HASH_MULTIPLIER).wrapping_add(u64::from(byte)));
+    path.bytes().fold(method_hash, |acc, byte| {
+        acc.wrapping_mul(HASH_MULTIPLIER).wrapping_add(u64::from(byte))
+    })
 }

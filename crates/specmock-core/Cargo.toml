@@ -6,20 +6,21 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-jsonschema = { version = "0.37.4", default-features = false }
-rand = { version = "0.10.0", default-features = false }
-rand_chacha = { version = "0.10.0", default-features = false }
-rand_regex = "0.19.0"
-scc = "3.6.5"
+jsonschema = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+rand_regex = { workspace = true }
+scc = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = { version = "1.0.149", default-features = false }
-serde_yml = "0.0.12"
-thiserror = { version = "2.0.18", default-features = false }
-tracing = "0.1.44"
+serde_json = { workspace = true }
+serde_yml = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 
-[lints]
-workspace = true
+[lints.clippy]
+# Inherit workspace lints but allow expect_used in test code
+expect_used = "allow"
 
 [dev-dependencies]
-regex-lite = "0.1.9"
-tempfile = "3.26.0"
+regex-lite = { workspace = true }
+tempfile = { workspace = true }

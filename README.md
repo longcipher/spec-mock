@@ -1,5 +1,12 @@
 # spec-mock
 
+[![DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/longcipher/spec-mock)
+[![Context7](https://img.shields.io/badge/Website-context7.com-blue)](https://context7.com/longcipher/spec-mock)
+[![crates.io](https://img.shields.io/crates/v/spec-mock.svg)](https://crates.io/crates/spec-mock)
+[![docs.rs](https://docs.rs/spec-mock/badge.svg)](https://docs.rs/spec-mock)
+
+![spec-mock](https://socialify.git.ci/longcipher/spec-mock/image?font=Source+Code+Pro&language=1&name=1&owner=1&pattern=Circuit+Board&theme=Auto)
+
 Pure Rust spec-driven mock runtime for:
 
 - HTTP REST from OpenAPI 3.0.x and 3.1.x

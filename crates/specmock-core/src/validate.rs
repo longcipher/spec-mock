@@ -11,8 +11,9 @@ use serde_json::Value;
 
 use crate::error::{SpecMockCoreError, ValidationIssue};
 
-static VALIDATOR_CACHE: LazyLock<HashMap<String, Arc<Validator>>> = LazyLock::new(HashMap::new);
 const DEFAULT_VALIDATOR_CACHE_MAX_ENTRIES: usize = 256;
+
+static VALIDATOR_CACHE: LazyLock<HashMap<String, Arc<Validator>>> = LazyLock::new(HashMap::new);
 static VALIDATOR_CACHE_MAX_ENTRIES: AtomicUsize =
     AtomicUsize::new(DEFAULT_VALIDATOR_CACHE_MAX_ENTRIES);
 
@@ -114,7 +115,7 @@ fn keyword_from_schema_path(schema_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{LazyLock, Mutex};
+    use std::sync::{LazyLock, Mutex, MutexGuard};
 
     use serde_json::json;
 
@@ -125,20 +126,36 @@ mod tests {
 
     static VALIDATOR_CACHE_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
 
-    struct CacheLimitReset(usize);
+    /// RAII guard that ensures proper cleanup of validator cache state.
+    struct CacheTestGuard {
+        _lock: MutexGuard<'static, ()>,
+        old_max: usize,
+    }
 
-    impl Drop for CacheLimitReset {
+    impl CacheTestGuard {
+        fn new() -> Self {
+            let lock = VALIDATOR_CACHE_TEST_GUARD.lock().unwrap_or_else(|poisoned| {
+                // If the lock is poisoned, clear the cache to ensure a clean state
+                clear_validator_cache_for_tests();
+                poisoned.into_inner()
+            });
+            let old_max = set_validator_cache_max_for_tests(4096);
+            clear_validator_cache_for_tests();
+            Self { _lock: lock, old_max }
+        }
+    }
+
+    impl Drop for CacheTestGuard {
         fn drop(&mut self) {
-            let _previous = set_validator_cache_max_for_tests(self.0);
+            // Restore original cache max and clear cache for next test
+            set_validator_cache_max_for_tests(self.old_max);
+            clear_validator_cache_for_tests();
         }
     }
 
     #[test]
     fn validator_cache_reuses_compiled_schema() {
-        let _guard = VALIDATOR_CACHE_TEST_GUARD.lock().unwrap_or_else(|err| err.into_inner());
-        let old_max = set_validator_cache_max_for_tests(4096);
-        let _reset = CacheLimitReset(old_max);
-        clear_validator_cache_for_tests();
+        let _guard = CacheTestGuard::new();
 
         let schema = json!({
             "type": "object",
@@ -171,10 +188,8 @@ mod tests {
 
     #[test]
     fn validator_cache_respects_max_entries() {
-        let _guard = VALIDATOR_CACHE_TEST_GUARD.lock().unwrap_or_else(|err| err.into_inner());
-        clear_validator_cache_for_tests();
-        let old_max = set_validator_cache_max_for_tests(2);
-        let _reset = CacheLimitReset(old_max);
+        let _guard = CacheTestGuard::new();
+        set_validator_cache_max_for_tests(2);
 
         let schema_a = json!({"type":"object","properties":{"id":{"type":"integer","minimum":1}}});
         let schema_b = json!({"type":"object","properties":{"id":{"type":"integer","minimum":2}}});

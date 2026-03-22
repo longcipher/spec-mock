@@ -9,6 +9,21 @@ pub mod grpc;
 pub mod http;
 pub mod ws;
 
+/// Default maximum request body size: 10 MiB.
+const DEFAULT_MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+
+/// Default HTTP listen address.
+const DEFAULT_HTTP_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 0);
+
+/// Default gRPC listen address.
+const DEFAULT_GRPC_ADDR: ([u8; 4], u16) = ([127, 0, 0, 1], 0);
+
+/// Default WebSocket path.
+const DEFAULT_WS_PATH: &str = "/ws";
+
+/// Default deterministic seed.
+const DEFAULT_SEED: u64 = 42;
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -42,12 +57,83 @@ impl Default for ServerConfig {
             proto_spec: None,
             mode: MockMode::Mock,
             upstream: None,
-            seed: 42,
-            http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            grpc_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
-            ws_path: "/ws".to_owned(),
-            max_body_size: 10 * 1024 * 1024,
+            seed: DEFAULT_SEED,
+            http_addr: SocketAddr::from(DEFAULT_HTTP_ADDR),
+            grpc_addr: SocketAddr::from(DEFAULT_GRPC_ADDR),
+            ws_path: DEFAULT_WS_PATH.to_owned(),
+            max_body_size: DEFAULT_MAX_BODY_SIZE,
         }
+    }
+}
+
+impl ServerConfig {
+    /// Validate the configuration.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        // Check that at least one spec is provided
+        if self.openapi_spec.is_none() && self.asyncapi_spec.is_none() && self.proto_spec.is_none()
+        {
+            return Err(RuntimeError::Config(
+                "at least one spec must be provided: openapi_spec, asyncapi_spec, or proto_spec"
+                    .to_owned(),
+            ));
+        }
+
+        // Check proxy mode configuration
+        if self.mode == MockMode::Proxy && self.upstream.is_none() {
+            return Err(RuntimeError::Config(
+                "proxy mode requires upstream base URL (--upstream)".to_owned(),
+            ));
+        }
+
+        // Check that HTTP and gRPC addresses are not the same
+        if self.http_addr == self.grpc_addr &&
+            self.http_addr.port() != 0 &&
+            self.grpc_addr.port() != 0
+        {
+            return Err(RuntimeError::Config(
+                "HTTP and gRPC addresses must be different".to_owned(),
+            ));
+        }
+
+        // Check that WebSocket path starts with /
+        if !self.ws_path.starts_with('/') {
+            return Err(RuntimeError::Config("WebSocket path must start with '/'".to_owned()));
+        }
+
+        // Check that max_body_size is reasonable
+        if self.max_body_size == 0 {
+            return Err(RuntimeError::Config("max_body_size must be greater than 0".to_owned()));
+        }
+
+        // Check that spec files exist
+        if let Some(ref path) = self.openapi_spec &&
+            !path.exists()
+        {
+            return Err(RuntimeError::Config(format!(
+                "OpenAPI spec file does not exist: {}",
+                path.display()
+            )));
+        }
+
+        if let Some(ref path) = self.asyncapi_spec &&
+            !path.exists()
+        {
+            return Err(RuntimeError::Config(format!(
+                "AsyncAPI spec file does not exist: {}",
+                path.display()
+            )));
+        }
+
+        if let Some(ref path) = self.proto_spec &&
+            !path.exists()
+        {
+            return Err(RuntimeError::Config(format!(
+                "Protobuf spec file does not exist: {}",
+                path.display()
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -101,15 +187,7 @@ pub enum RuntimeError {
 
 /// Start protocol runtimes.
 pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> {
-    if config.openapi_spec.is_none() &&
-        config.asyncapi_spec.is_none() &&
-        config.proto_spec.is_none()
-    {
-        return Err(RuntimeError::Config(
-            "at least one spec must be provided: openapi_spec, asyncapi_spec, or proto_spec"
-                .to_owned(),
-        ));
-    }
+    config.validate()?;
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let shared_shutdown = Arc::new(tokio::sync::Notify::new());

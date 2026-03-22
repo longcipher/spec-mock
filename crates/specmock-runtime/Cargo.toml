@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-axum = { version = "0.8.8", features = [
+axum = { workspace = true, features = [
     "ws",
     "json",
     "query",
@@ -14,27 +14,27 @@ axum = { version = "0.8.8", features = [
     "tracing",
     "http1",
 ] }
-base64 = "0.22.1"
-bytes = "1.11.1"
-futures-util = "0.3.32"
-hpx = "2.3.1"
-http = "1.4.0"
-http-body = "1"
-http-body-util = "0.1"
-hyper = { version = "1", features = ["server"] }
-hyper-util = { version = "0.1.20", features = [
+base64 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+hpx = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["server"] }
+hyper-util = { workspace = true, features = [
     "tokio",
     "server-auto",
     "service",
 ] }
-prost = "0.14.3"
-prost-reflect = "0.16.3"
-protox = "0.9.1"
+prost = { workspace = true }
+prost-reflect = { workspace = true }
+protox = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
-serde_json = "1.0.149"
-specmock-core = { version = "0.1.0", path = "../specmock-core" }
-thiserror = "2.0.18"
-tokio = { version = "1.49.0", features = [
+serde_json = { workspace = true }
+specmock-core = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = [
     "rt-multi-thread",
     "macros",
     "net",
@@ -42,10 +42,10 @@ tokio = { version = "1.49.0", features = [
     "signal",
     "time",
 ] }
-tonic = { version = "0.14", default-features = false, features = ["transport"] }
-tower = { version = "0.5", features = ["util"] }
-tracing = "0.1.44"
-url = "2.5.8"
+tonic = { workspace = true, features = ["transport"] }
+tower = { workspace = true, features = ["util"] }
+tracing = { workspace = true }
+url = { workspace = true }
 
 [features]
 integration-test = []
@@ -54,12 +54,12 @@ integration-test = []
 workspace = true
 
 [dev-dependencies]
-hpx = "2.3.1"
-rand = "0.10.0"
-rand_chacha = "0.10.0"
-serde_yml = "0.0.12"
-tokio-tungstenite = "0.28.0"
-tonic = { version = "0.14", default-features = false, features = [
+hpx = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde_yml = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tonic = { workspace = true, features = [
     "codegen",
     "transport",
 ] }
