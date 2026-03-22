@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Runtime servers for HTTP (OpenAPI), WebSocket (AsyncAPI), and gRPC (Protobuf) mocking"
 
 [dependencies]
 axum = { workspace = true, features = [
@@ -50,8 +56,9 @@ url = { workspace = true }
 [features]
 integration-test = []
 
-[lints]
-workspace = true
+[lints.clippy]
+# Inherit workspace lints but allow expect_used in test code
+expect_used = "allow"
 
 [dev-dependencies]
 hpx = { workspace = true }

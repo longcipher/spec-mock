@@ -595,7 +595,7 @@ mod tests {
         assert!(obj.contains_key("id"), "required property missing");
         // Should have 1 or 2 extra keys.
         let extra_count = obj.keys().filter(|k| k.starts_with("extra_")).count();
-        assert!(extra_count >= 1 && extra_count <= 2, "expected 1-2 extra keys, got {extra_count}");
+        assert!((1..=2).contains(&extra_count), "expected 1-2 extra keys, got {extra_count}");
         for key in obj.keys().filter(|k| k.starts_with("extra_")) {
             assert!(obj[key].is_i64() || obj[key].is_u64(), "extra value should be integer");
         }

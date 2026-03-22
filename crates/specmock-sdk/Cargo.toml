@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Rust SDK for embedding spec-mock runtime in tests and process mode"
 
 [dependencies]
 specmock-core = { workspace = true }

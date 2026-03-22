@@ -2,7 +2,12 @@
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "TODO"
+repository = "https://github.com/longcipher/spec-mock"
+homepage = "https://github.com/longcipher/spec-mock"
+documentation = "https://docs.rs/specmock-core"
+readme = "README.md"
+keywords = ["mock", "openapi", "asyncapi", "grpc", "testing"]
+categories = ["development-tools::testing", "web-programming", "simulation"]
 
 [workspace]
 members = ["bin/*", "crates/*"]

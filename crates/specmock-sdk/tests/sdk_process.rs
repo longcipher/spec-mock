@@ -26,7 +26,7 @@ fn free_local_addr() -> Result<SocketAddr, std::io::Error> {
 fn process_bin_path() -> Option<PathBuf> {
     std::env::var_os("CARGO_BIN_EXE_spec-mock").and_then(|path| {
         let path = PathBuf::from(path);
-        if path.is_file() { Some(path) } else { None }
+        path.is_file().then_some(path)
     })
 }
 
