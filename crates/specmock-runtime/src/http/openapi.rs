@@ -628,15 +628,11 @@ pub fn resolve_callback_url(expression: &str, request_body: Option<&Value>) -> O
         let token = &after_open[..close];
         remaining = &after_open[close + 1..];
 
-        if let Some(pointer_path) = token.strip_prefix("$request.body#") {
-            let body = request_body?;
-            let value = json_pointer(body, pointer_path)?;
-            let text = value.as_str().map_or_else(|| value.to_string(), ToOwned::to_owned);
-            result.push_str(&text);
-        } else {
-            // Unsupported expression token – bail out.
-            return None;
-        }
+        let pointer_path = token.strip_prefix("$request.body#")?;
+        let body = request_body?;
+        let value = json_pointer(body, pointer_path)?;
+        let text = value.as_str().map_or_else(|| value.to_string(), ToOwned::to_owned);
+        result.push_str(&text);
     }
     result.push_str(remaining);
 
