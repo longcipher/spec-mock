@@ -30,6 +30,7 @@ pub enum SdkError {
 #[derive(Debug)]
 pub struct MockServer {
     running: RunningServer,
+    ws_path: String,
 }
 
 impl MockServer {
@@ -48,7 +49,7 @@ impl MockServer {
     /// WebSocket URL.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        format!("ws://{}/ws", self.running.http_addr)
+        format!("ws://{}{}", self.running.http_addr, self.ws_path)
     }
 
     /// Bound gRPC address.
@@ -69,6 +70,7 @@ pub struct ProcessMockServer {
     child: Child,
     http_addr: SocketAddr,
     grpc_addr: Option<SocketAddr>,
+    ws_path: String,
 }
 
 impl ProcessMockServer {
@@ -81,7 +83,7 @@ impl ProcessMockServer {
     /// WebSocket URL.
     #[must_use]
     pub fn ws_url(&self) -> String {
-        format!("ws://{}/ws", self.http_addr)
+        format!("ws://{}{}", self.http_addr, self.ws_path)
     }
 
     /// gRPC address if configured.
@@ -177,10 +179,18 @@ impl MockServerBuilder {
         self
     }
 
+    /// Allow private/link-local/loopback upstream URLs in proxy mode.
+    #[must_use]
+    pub const fn allow_private_upstream(mut self, allow: bool) -> Self {
+        self.config.allow_private_upstream = allow;
+        self
+    }
+
     /// Start in-process runtime, ideal for `#[tokio::test]`.
     pub async fn start(self) -> Result<MockServer, SdkError> {
+        let ws_path = self.config.ws_path.clone();
         let running = specmock_runtime::start(self.config).await?;
-        Ok(MockServer { running })
+        Ok(MockServer { running, ws_path })
     }
 
     /// Start standalone CLI process.
@@ -223,6 +233,9 @@ impl MockServerBuilder {
         if let Some(upstream) = &self.config.upstream {
             command.arg("--upstream").arg(upstream);
         }
+        if self.config.allow_private_upstream {
+            command.arg("--allow-private-upstream");
+        }
         command.arg("--max-body-size").arg(self.config.max_body_size.to_string());
 
         let mut child = command.spawn()?;
@@ -242,6 +255,7 @@ impl MockServerBuilder {
             child,
             http_addr: self.config.http_addr,
             grpc_addr: self.config.proto_spec.as_ref().map(|_path| self.config.grpc_addr),
+            ws_path: self.config.ws_path,
         })
     }
 }

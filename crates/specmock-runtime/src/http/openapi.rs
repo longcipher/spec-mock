@@ -1,11 +1,16 @@
 //! Minimal OpenAPI 3.0/3.1 runtime parser and request/response engine.
 
-use std::{collections::HashMap, path::Path};
+use std::{
+    collections::{BTreeMap, HashMap},
+    path::Path,
+};
 
 use http::{HeaderMap, Method};
 use serde_json::{Map, Value};
 use specmock_core::{
-    ValidationIssue, faker::generate_json_value, ref_resolver::RefResolver,
+    ValidationIssue,
+    faker::generate_json_value,
+    ref_resolver::{RefResolver, resolve_pointer},
     validate::validate_instance,
 };
 
@@ -94,7 +99,7 @@ pub struct ResponseSpec {
     /// Explicit example payload.
     pub example: Option<Value>,
     /// Named examples keyed by example name.
-    pub named_examples: HashMap<String, Value>,
+    pub named_examples: BTreeMap<String, Value>,
 }
 
 /// Generated response.
@@ -116,7 +121,7 @@ impl OpenApiRuntime {
         let mut resolver = RefResolver::new(base_dir);
         let resolved =
             resolver.resolve(path).map_err(|error| RuntimeError::Parse(error.to_string()))?;
-        Self::from_resolved(resolved.root)
+        Self::from_resolved(resolved)
     }
 
     /// Build from an already-resolved OpenAPI document value.
@@ -365,7 +370,7 @@ impl OperationSpec {
         prefer: &super::negotiate::PreferDirectives,
     ) -> Result<MockHttpResponse, RuntimeError> {
         let selected = super::negotiate::select_response(&self.responses, prefer)
-            .ok_or_else(|| RuntimeError::Parse("operation has no responses".to_owned()))?;
+            .ok_or_else(|| RuntimeError::NotFound("preferred code not found".to_owned()))?;
 
         // Named example override.
         if let Some(name) = &prefer.example &&
@@ -458,8 +463,8 @@ fn parse_parameters(
             .and_then(Value::as_object)
             .cloned()
             .unwrap_or_else(Map::new);
-        let normalized =
-            normalize_schema(Value::Object(schema), openapi_version.starts_with("3.0"));
+        let mut normalized = Value::Object(schema);
+        normalize_schema(&mut normalized, openapi_version.starts_with("3.0"));
 
         parameters.push(ParameterSpec {
             name: name.to_owned(),
@@ -484,11 +489,7 @@ fn parse_request_body(
     let Some(content) = request_body.get("content").and_then(Value::as_object) else {
         return Ok((None, required));
     };
-    let Some(media_type) = content
-        .get("application/json")
-        .and_then(Value::as_object)
-        .cloned()
-        .or_else(|| content.values().find_map(Value::as_object).cloned())
+    let Some(media_type) = content.get("application/json").and_then(Value::as_object).cloned()
     else {
         return Ok((None, required));
     };
@@ -497,10 +498,9 @@ fn parse_request_body(
         return Ok((None, required));
     };
 
-    Ok((
-        Some(normalize_schema(Value::Object(schema.clone()), openapi_version.starts_with("3.0"))),
-        required,
-    ))
+    let mut schema_value = Value::Object(schema.clone());
+    normalize_schema(&mut schema_value, openapi_version.starts_with("3.0"));
+    Ok((Some(schema_value), required))
 }
 
 fn parse_responses(
@@ -519,20 +519,16 @@ fn parse_responses(
 
         let (schema, example, named_examples) = if let Some(content) =
             response_object.get("content").and_then(Value::as_object) &&
-            let Some(media_type) = content
-                .get("application/json")
-                .and_then(Value::as_object)
-                .cloned()
-                .or_else(|| content.values().find_map(Value::as_object).cloned())
+            let Some(media_type) =
+                content.get("application/json").and_then(Value::as_object).cloned()
         {
             let schema = media_type.get("schema").and_then(Value::as_object).map(|schema_object| {
-                normalize_schema(
-                    Value::Object(schema_object.clone()),
-                    openapi_version.starts_with("3.0"),
-                )
+                let mut s = Value::Object(schema_object.clone());
+                normalize_schema(&mut s, openapi_version.starts_with("3.0"));
+                s
             });
             // Collect named examples map.
-            let mut named_examples = HashMap::new();
+            let mut named_examples = BTreeMap::new();
             if let Some(examples_obj) = media_type.get("examples").and_then(Value::as_object) {
                 for (example_name, example_entry) in examples_obj {
                     if let Some(val) = example_entry.get("value") {
@@ -547,7 +543,7 @@ fn parse_responses(
                 .or_else(|| named_examples.values().next().cloned());
             (schema, example, named_examples)
         } else {
-            (None, None, HashMap::new())
+            (None, None, BTreeMap::new())
         };
 
         responses.push(ResponseSpec { status: status.clone(), schema, example, named_examples });
@@ -590,15 +586,13 @@ fn parse_callbacks(
                     .and_then(|rb| rb.get("content"))
                     .and_then(Value::as_object)
                     .and_then(|content| {
-                        content
-                            .get("application/json")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .or_else(|| content.values().find_map(Value::as_object).cloned())
+                        content.get("application/json").and_then(Value::as_object).cloned()
                     })
                     .and_then(|media| media.get("schema").and_then(Value::as_object).cloned())
                     .map(|s| {
-                        normalize_schema(Value::Object(s), openapi_version.starts_with("3.0"))
+                        let mut sv = Value::Object(s);
+                        normalize_schema(&mut sv, openapi_version.starts_with("3.0"));
+                        sv
                     });
 
                 callbacks.push(CallbackSpec {
@@ -628,61 +622,43 @@ pub fn resolve_callback_url(expression: &str, request_body: Option<&Value>) -> O
         let token = &after_open[..close];
         remaining = &after_open[close + 1..];
 
-        let pointer_path = token.strip_prefix("$request.body#")?;
-        let body = request_body?;
-        let value = json_pointer(body, pointer_path)?;
-        let text = value.as_str().map_or_else(|| value.to_string(), ToOwned::to_owned);
-        result.push_str(&text);
+        if let Some(pointer_path) = token.strip_prefix("$request.body#") &&
+            let Some(body) = request_body &&
+            let Some(value) = resolve_pointer(body, pointer_path)
+        {
+            let text = value.as_str().map_or_else(|| value.to_string(), ToOwned::to_owned);
+            result.push_str(&text);
+            continue;
+        }
+        result.push('{');
+        result.push_str(token);
+        result.push('}');
     }
     result.push_str(remaining);
 
     if result.is_empty() { None } else { Some(result) }
 }
 
-/// Minimal JSON Pointer (RFC 6901) resolver.
-fn json_pointer<'a>(value: &'a Value, pointer: &str) -> Option<&'a Value> {
-    if pointer.is_empty() || pointer == "/" {
-        return Some(value);
-    }
-    let path = pointer.strip_prefix('/')?;
-    let mut current = value;
-    for segment in path.split('/') {
-        let decoded = segment.replace("~1", "/").replace("~0", "~");
-        match current {
-            Value::Object(map) => current = map.get(&decoded)?,
-            Value::Array(arr) => {
-                let idx: usize = decoded.parse().ok()?;
-                current = arr.get(idx)?;
-            }
-            _ => return None,
-        }
-    }
-    Some(current)
-}
-
-fn normalize_schema(mut schema: Value, use_nullable_transform: bool) -> Value {
+fn normalize_schema(schema: &mut Value, use_nullable_transform: bool) {
     if let Some(object) = schema.as_object_mut() {
         for nested_key in ["properties", "$defs", "definitions"] {
             if let Some(properties) = object.get_mut(nested_key).and_then(Value::as_object_mut) {
                 for value in properties.values_mut() {
-                    let normalized = normalize_schema(value.clone(), use_nullable_transform);
-                    *value = normalized;
+                    normalize_schema(value, use_nullable_transform);
                 }
             }
         }
 
         for nested_key in ["items", "additionalProperties", "not"] {
             if let Some(value) = object.get_mut(nested_key) {
-                let normalized = normalize_schema(value.clone(), use_nullable_transform);
-                *value = normalized;
+                normalize_schema(value, use_nullable_transform);
             }
         }
 
         for nested_key in ["allOf", "anyOf", "oneOf"] {
             if let Some(items) = object.get_mut(nested_key).and_then(Value::as_array_mut) {
                 for item in items {
-                    let normalized = normalize_schema(item.clone(), use_nullable_transform);
-                    *item = normalized;
+                    normalize_schema(item, use_nullable_transform);
                 }
             }
         }
@@ -709,7 +685,6 @@ fn normalize_schema(mut schema: Value, use_nullable_transform: bool) -> Value {
             object.remove("nullable");
         }
     }
-    schema
 }
 
 /// Returns `true` when the schema's `type` field is (or includes) `"array"`.
@@ -822,5 +797,37 @@ mod tests {
             None,
         );
         assert!(!numeric_issues.is_empty(), "operation-level pattern should reject numeric id");
+    }
+
+    #[test]
+    fn non_json_content_type_returns_no_schema() {
+        let operation = serde_json::json!({
+            "requestBody": {
+                "content": {
+                    "application/xml": {
+                        "schema": {"type": "string"}
+                    }
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let (schema, _required) = super::parse_request_body(&operation, "3.1.0").unwrap();
+        assert!(schema.is_none(), "non-JSON content type should not produce a schema");
+    }
+
+    #[test]
+    fn callback_url_keeps_non_body_tokens_literal() {
+        let body = serde_json::json!({"url": "https://cb.example.com/hook"});
+        let result = super::resolve_callback_url("{$request.body#/url}/{$method}", Some(&body));
+        assert_eq!(result.as_deref(), Some("https://cb.example.com/hook/{$method}"));
+    }
+
+    #[test]
+    fn callback_url_only_non_body_tokens() {
+        let result = super::resolve_callback_url("{$method}/{$url}/notify", None);
+        assert_eq!(result.as_deref(), Some("{$method}/{$url}/notify"));
     }
 }

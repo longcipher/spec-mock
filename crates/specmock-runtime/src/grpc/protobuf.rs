@@ -160,7 +160,7 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
                 ));
             }
 
-            let response_seed = seed ^ hash_path(&path);
+            let response_seed = crate::deterministic_hash(seed, &path);
 
             // --- server streaming ---
             if method.is_server_streaming() {
@@ -168,7 +168,8 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
             }
 
             // --- unary response ---
-            let response_message = match generate_dynamic_message(method.output(), response_seed) {
+            let response_message = match generate_dynamic_message(method.output(), response_seed, 0)
+            {
                 Ok(message) => message,
                 Err(error) => {
                     return Ok(grpc_error_response(
@@ -205,7 +206,7 @@ const STREAMING_COUNT: u64 = 3;
 fn build_streaming_response(method: &MethodDescriptor, base_seed: u64) -> http::Response<BoxBody> {
     let mut frames = Vec::with_capacity(STREAMING_COUNT as usize);
     for i in 0..STREAMING_COUNT {
-        match generate_dynamic_message(method.output(), base_seed.wrapping_add(i)) {
+        match generate_dynamic_message(method.output(), base_seed.wrapping_add(i), 0) {
             Ok(msg) => {
                 let encoded = msg.encode_to_vec();
                 frames.push(Bytes::from(encode_grpc_unary_frame(&encoded)));
@@ -526,7 +527,11 @@ fn pointer_to_field_path(pointer: &str) -> String {
 fn generate_dynamic_message(
     descriptor: prost_reflect::MessageDescriptor,
     seed: u64,
+    depth: usize,
 ) -> Result<DynamicMessage, String> {
+    if depth > 32 {
+        return Err("maximum protobuf message recursion depth reached".to_owned());
+    }
     let mut message = DynamicMessage::new(descriptor.clone());
     let mut oneof_taken = std::collections::HashSet::new();
 
@@ -547,7 +552,8 @@ fn generate_dynamic_message(
         }
 
         if field.is_list() {
-            let item = scalar_value_for_field(&field.kind(), seed ^ u64::from(field.number()))?;
+            let item =
+                scalar_value_for_field(&field.kind(), seed ^ u64::from(field.number()), depth)?;
             message
                 .try_set_field(&field, Value::List(vec![item]))
                 .map_err(|error| error.to_string())?;
@@ -558,7 +564,8 @@ fn generate_dynamic_message(
             field.cardinality() == Cardinality::Required ||
             field.supports_presence()
         {
-            let value = scalar_value_for_field(&field.kind(), seed ^ u64::from(field.number()))?;
+            let value =
+                scalar_value_for_field(&field.kind(), seed ^ u64::from(field.number()), depth)?;
             message.try_set_field(&field, value).map_err(|error| error.to_string())?;
         }
     }
@@ -566,7 +573,7 @@ fn generate_dynamic_message(
     Ok(message)
 }
 
-fn scalar_value_for_field(kind: &Kind, seed: u64) -> Result<Value, String> {
+fn scalar_value_for_field(kind: &Kind, seed: u64, depth: usize) -> Result<Value, String> {
     match kind {
         Kind::Bool => Ok(Value::Bool((seed & 1) == 1)),
         Kind::Int32 | Kind::Sint32 | Kind::Sfixed32 => Ok(Value::I32((seed % 2048) as i32)),
@@ -583,14 +590,10 @@ fn scalar_value_for_field(kind: &Kind, seed: u64) -> Result<Value, String> {
             Ok(Value::EnumNumber(first.number()))
         }
         Kind::Message(message_descriptor) => {
-            let nested = generate_dynamic_message(message_descriptor.clone(), seed + 1)?;
+            let nested = generate_dynamic_message(message_descriptor.clone(), seed + 1, depth + 1)?;
             Ok(Value::Message(nested))
         }
     }
-}
-
-fn hash_path(path: &str) -> u64 {
-    path.bytes().fold(0_u64, |acc, byte| acc.wrapping_mul(131).wrapping_add(u64::from(byte)))
 }
 
 // ---------------------------------------------------------------------------

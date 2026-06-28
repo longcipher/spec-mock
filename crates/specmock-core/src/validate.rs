@@ -1,8 +1,11 @@
 //! JSON schema validation helpers.
 
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicUsize, Ordering},
+use std::{
+    hash::{DefaultHasher, Hash, Hasher},
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use jsonschema::{Validator, validator_for};
@@ -13,9 +16,16 @@ use crate::error::{SpecMockCoreError, ValidationIssue};
 
 const DEFAULT_VALIDATOR_CACHE_MAX_ENTRIES: usize = 256;
 
-static VALIDATOR_CACHE: LazyLock<HashMap<String, Arc<Validator>>> = LazyLock::new(HashMap::new);
+static VALIDATOR_CACHE: LazyLock<HashMap<u64, Arc<Validator>>> = LazyLock::new(HashMap::new);
 static VALIDATOR_CACHE_MAX_ENTRIES: AtomicUsize =
     AtomicUsize::new(DEFAULT_VALIDATOR_CACHE_MAX_ENTRIES);
+
+fn hash_value(value: &Value) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let s = serde_json::to_string(value).unwrap_or_default();
+    s.hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Validate an instance against a JSON schema and return all issues.
 pub fn validate_instance(
@@ -39,9 +49,7 @@ pub fn validate_instance(
 }
 
 fn get_or_compile_validator(schema: &Value) -> Result<Arc<Validator>, SpecMockCoreError> {
-    let cache_key = serde_json::to_string(schema).map_err(|error| {
-        SpecMockCoreError::Schema(format!("schema cache key serialization failed: {error}"))
-    })?;
+    let cache_key = hash_value(schema);
 
     if let Some(cached) =
         VALIDATOR_CACHE.read_sync(&cache_key, |_, validator| Arc::clone(validator))
@@ -53,7 +61,7 @@ fn get_or_compile_validator(schema: &Value) -> Result<Arc<Validator>, SpecMockCo
         SpecMockCoreError::Schema(format!("{error} (schema_path={})", error.schema_path().as_str()))
     })?);
 
-    match VALIDATOR_CACHE.insert_sync(cache_key.clone(), Arc::clone(&compiled)) {
+    match VALIDATOR_CACHE.insert_sync(cache_key, Arc::clone(&compiled)) {
         Ok(()) => {
             trim_validator_cache_if_needed();
             Ok(compiled)
@@ -72,9 +80,9 @@ fn get_or_compile_validator(schema: &Value) -> Result<Arc<Validator>, SpecMockCo
 fn trim_validator_cache_if_needed() {
     let max_entries = VALIDATOR_CACHE_MAX_ENTRIES.load(Ordering::Relaxed).max(1);
     while VALIDATOR_CACHE.len() > max_entries {
-        let mut key_to_remove = None::<String>;
+        let mut key_to_remove = None::<u64>;
         VALIDATOR_CACHE.iter_sync(|key, _value| {
-            key_to_remove = Some(key.clone());
+            key_to_remove = Some(*key);
             false
         });
         if let Some(key) = key_to_remove {
@@ -97,7 +105,7 @@ pub(crate) fn cached_validator_count_for_tests() -> usize {
 
 #[cfg(test)]
 pub(crate) fn cached_validator_address_for_tests(schema: &Value) -> Option<usize> {
-    let cache_key = serde_json::to_string(schema).ok()?;
+    let cache_key = hash_value(schema);
     VALIDATOR_CACHE.read_sync(&cache_key, |_, validator| Arc::as_ptr(validator) as usize)
 }
 

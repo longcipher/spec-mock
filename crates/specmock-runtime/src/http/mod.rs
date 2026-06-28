@@ -28,9 +28,6 @@ use tokio::{net::TcpListener, task::JoinHandle};
 
 use crate::{RuntimeError, ws::AsyncApiRuntime};
 
-/// Hash multiplier for path and method hashing.
-const HASH_MULTIPLIER: u64 = 131;
-
 /// Shared runtime state.
 #[derive(Clone)]
 pub struct HttpRuntime {
@@ -212,7 +209,7 @@ async fn http_fallback_handler(
     }
 
     let prefer = PreferDirectives::from_headers(&headers);
-    let seed = runtime.seed ^ hash_path_and_method(&path, &method);
+    let seed = crate::deterministic_hash(runtime.seed, &format!("{method}{path}"));
     let response = match matched.operation.mock_response(seed, &prefer) {
         Ok(mock_response) => {
             if let Some(body) = mock_response.body {
@@ -227,6 +224,9 @@ async fn http_fallback_handler(
                     .unwrap_or_else(|_error| Response::new(Body::empty()))
             }
         }
+        Err(RuntimeError::NotFound(message)) => {
+            return problem_response(ProblemDetails::not_found(&message));
+        }
         Err(error) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -234,7 +234,7 @@ async fn http_fallback_handler(
                     instance_pointer: "/response".to_owned(),
                     schema_pointer: "#/responses".to_owned(),
                     keyword: "response".to_owned(),
-                    message: error.to_string(),
+                    message: sanitize_error_message(&error.to_string()),
                 }],
             );
         }
@@ -247,6 +247,10 @@ async fn http_fallback_handler(
                 &callback.callback_url_expression,
                 request_body_json.as_ref(),
             ) {
+                if !is_valid_callback_url(&url) {
+                    tracing::warn!(url, "callback skipped: non-HTTP scheme");
+                    continue;
+                }
                 let client = runtime.client.clone();
                 let cb_method = callback.method.clone();
                 let cb_schema = callback.request_body_schema.clone();
@@ -344,12 +348,84 @@ fn json_response(status: StatusCode, body: &Value) -> Response {
     (status, Json(body.clone())).into_response()
 }
 
-fn hash_path_and_method(path: &str, method: &Method) -> u64 {
-    let method_hash = method
-        .as_str()
-        .bytes()
-        .fold(0_u64, |acc, byte| acc.wrapping_mul(HASH_MULTIPLIER).wrapping_add(u64::from(byte)));
-    path.bytes().fold(method_hash, |acc, byte| {
-        acc.wrapping_mul(HASH_MULTIPLIER).wrapping_add(u64::from(byte))
-    })
+/// Replace tokens that look like absolute filesystem paths with `[redacted]`.
+///
+/// A token is considered path-like if it starts with `/` and contains at least
+/// one additional `/` separator (i.e. `/foo/bar` but not `/pets/{id}`).
+fn sanitize_error_message(msg: &str) -> String {
+    msg.split_whitespace()
+        .map(
+            |token| {
+                if token.starts_with('/') && token[1..].contains('/') {
+                    "[redacted]"
+                } else {
+                    token
+                }
+            },
+        )
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn is_valid_callback_url(url: &str) -> bool {
+    // ponytail: SSRF guard — reject non-http(s) schemes
+    matches!(
+        url::Url::parse(url).map(|u| u.scheme().to_owned()),
+        Ok(scheme) if scheme == "http" || scheme == "https"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_url_rejects_non_http_schemes() {
+        assert!(!is_valid_callback_url("file:///etc/passwd"));
+        assert!(!is_valid_callback_url("ftp://example.com"));
+        assert!(!is_valid_callback_url("javascript:alert(1)"));
+        assert!(!is_valid_callback_url("data:text/html,<h1>hi</h1>"));
+    }
+
+    #[test]
+    fn callback_url_accepts_http_schemes() {
+        assert!(is_valid_callback_url("http://example.com/cb"));
+        assert!(is_valid_callback_url("https://example.com/cb?token=abc"));
+    }
+
+    #[test]
+    fn callback_url_rejects_malformed_urls() {
+        assert!(!is_valid_callback_url("not a url"));
+        assert!(!is_valid_callback_url(""));
+    }
+
+    #[test]
+    fn sanitize_strips_absolute_paths() {
+        let input = "cannot read /Users/dev/project/specs/api.yaml";
+        let out = sanitize_error_message(input);
+        assert!(!out.contains("/Users"), "should redact /Users path: {out}");
+        assert!(out.contains("[redacted]"), "should contain [redacted]: {out}");
+    }
+
+    #[test]
+    fn sanitize_strips_multiple_paths() {
+        let input = "file ref points outside allowed roots /tmp/foo/bar";
+        let out = sanitize_error_message(input);
+        assert!(!out.contains("/tmp"), "should redact /tmp path: {out}");
+    }
+
+    #[test]
+    fn sanitize_preserves_non_path_text() {
+        let input = "invalid yaml: mapping values are not allowed here";
+        let out = sanitize_error_message(input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn sanitize_preserves_single_segment_slash() {
+        // Things like "/pets/{id}" or "/response" should NOT be redacted.
+        let input = "operation not found at /response";
+        let out = sanitize_error_message(input);
+        assert_eq!(out, input);
+    }
 }

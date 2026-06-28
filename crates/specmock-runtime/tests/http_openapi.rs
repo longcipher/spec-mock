@@ -782,6 +782,151 @@ async fn content_types_returns_json_by_default() -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
+// ── Proxy strips sensitive headers ─────────────────────────────────────
+
+#[tokio::test]
+async fn proxy_strips_auth_headers() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Start a mock upstream that echoes received headers back in the body.
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _addr) = upstream_listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 8192];
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.expect("read");
+        let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+        let body = r#"{"id":1,"name":"mock"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write");
+        request
+    });
+
+    // 2. Start spec-mock in proxy mode.
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_spec_path()),
+        mode: MockMode::Proxy,
+        upstream: Some(format!("http://{upstream_addr}")),
+        allow_private_upstream: true,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    // 3. Send request with sensitive headers.
+    let response = hpx::get(format!("http://{}/pets/1", server.http_addr))
+        .header("Authorization", "Bearer secret-token")
+        .header("Cookie", "session=abc")
+        .header("Proxy-Authorization", "Basic proxy-secret")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 200);
+
+    // 4. Verify upstream did NOT receive sensitive headers.
+    let upstream_request = tokio::time::timeout(std::time::Duration::from_secs(5), upstream_task)
+        .await
+        .expect("upstream task timeout")
+        .expect("upstream task join");
+
+    let lower = upstream_request.to_ascii_lowercase();
+    assert!(!lower.contains("authorization:"), "upstream should not receive Authorization header");
+    assert!(!lower.contains("cookie:"), "upstream should not receive Cookie header");
+    assert!(
+        !lower.contains("proxy-authorization:"),
+        "upstream should not receive Proxy-Authorization header"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+// ── Proxy forwards upstream responses ─────────────────────────────────
+
+#[tokio::test]
+async fn proxy_forwards_request_and_returns_upstream_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let upstream_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let upstream_addr = upstream_listener.local_addr()?;
+
+    let upstream_task = tokio::spawn(async move {
+        let (mut stream, _addr) = upstream_listener.accept().await.expect("accept");
+        let mut buf = vec![0u8; 8192];
+        tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.expect("read");
+        let body = r#"{"id":99,"name":"upstream-pet"}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut stream, response.as_bytes()).await.expect("write");
+    });
+
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_spec_path()),
+        mode: MockMode::Proxy,
+        upstream: Some(format!("http://{upstream_addr}")),
+        allow_private_upstream: true,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    let response = hpx::get(format!("http://{}/pets/1", server.http_addr)).send().await?;
+    assert_eq!(response.status().as_u16(), 200);
+    let body: serde_json::Value = serde_json::from_slice(&response.bytes().await?)?;
+    assert_eq!(body.get("name").and_then(serde_json::Value::as_str), Some("upstream-pet"));
+
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(3), upstream_task).await;
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn proxy_returns_502_when_upstream_connection_refused()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_spec_path()),
+        mode: MockMode::Proxy,
+        upstream: Some("http://127.0.0.1:1".into()),
+        allow_private_upstream: true,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    let response = hpx::get(format!("http://{}/pets/1", server.http_addr)).send().await?;
+    assert_eq!(response.status().as_u16(), 502);
+
+    server.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn content_types_health_check() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {

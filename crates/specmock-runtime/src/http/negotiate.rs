@@ -120,9 +120,7 @@ pub fn select_response<'a>(
 ) -> Option<&'a ResponseSpec> {
     if let Some(code) = prefer.code {
         let code_str = code.to_string();
-        if let Some(found) = responses.iter().find(|r| r.status == code_str) {
-            return Some(found);
-        }
+        return responses.iter().find(|r| r.status == code_str);
     }
 
     responses
@@ -180,7 +178,7 @@ pub fn negotiate_media_type(available: &[String], accept_header: Option<&str>) -
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use http::HeaderMap;
 
@@ -253,19 +251,19 @@ mod tests {
                 status: "200".into(),
                 schema: None,
                 example: None,
-                named_examples: HashMap::new(),
+                named_examples: BTreeMap::new(),
             },
             ResponseSpec {
                 status: "404".into(),
                 schema: None,
                 example: None,
-                named_examples: HashMap::new(),
+                named_examples: BTreeMap::new(),
             },
             ResponseSpec {
                 status: "500".into(),
                 schema: None,
                 example: None,
-                named_examples: HashMap::new(),
+                named_examples: BTreeMap::new(),
             },
         ]
     }
@@ -291,8 +289,7 @@ mod tests {
         let responses = make_responses();
         let prefer = PreferDirectives { code: Some(418), ..Default::default() };
         let selected = select_response(&responses, &prefer);
-        // No 418, falls back to 200
-        assert_eq!(selected.map(|r| r.status.as_str()), Some("200"));
+        assert!(selected.is_none(), "requested code 418 not found should return None");
     }
 
     #[test]
@@ -301,7 +298,7 @@ mod tests {
             status: "default".into(),
             schema: None,
             example: None,
-            named_examples: HashMap::new(),
+            named_examples: BTreeMap::new(),
         }];
         let prefer = PreferDirectives::default();
         let selected = select_response(&responses, &prefer);

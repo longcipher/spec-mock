@@ -52,7 +52,7 @@ impl AsyncApiRuntime {
         let mut resolver = RefResolver::new(base_dir);
         let resolved =
             resolver.resolve(path).map_err(|error| RuntimeError::Parse(error.to_string()))?;
-        Self::from_document(resolved.root)
+        Self::from_document(resolved)
     }
 
     fn from_document(root: Value) -> Result<Self, RuntimeError> {
@@ -196,7 +196,7 @@ impl AsyncApiRuntime {
         }
 
         if let Some(schema) = &channel.subscribe_schema {
-            let derived_seed = seed ^ hash_channel(&resolved.channel_name);
+            let derived_seed = crate::deterministic_hash(seed, &resolved.channel_name);
             match generate_json_value(schema, derived_seed) {
                 Ok(payload) => WsOutcome::Mock { channel: resolved.channel_name, payload },
                 Err(error) => WsOutcome::Error {
@@ -316,10 +316,6 @@ fn extract_v3_operation_messages(op_node: &Value) -> (Option<Value>, Option<Valu
         .and_then(|ex| ex.get("payload").cloned());
 
     (schema, example)
-}
-
-fn hash_channel(channel: &str) -> u64 {
-    channel.bytes().fold(0_u64, |acc, byte| acc.wrapping_mul(109).wrapping_add(u64::from(byte)))
 }
 
 #[cfg(test)]

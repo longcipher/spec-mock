@@ -12,6 +12,9 @@ use super::{HttpRuntime, error_response, header_is_json};
 
 const HEADER_HOST: &str = "host";
 const HEADER_CONTENT_LENGTH: &str = "content-length";
+const HEADER_AUTHORIZATION: &str = "authorization";
+const HEADER_COOKIE: &str = "cookie";
+const HEADER_PROXY_AUTHORIZATION: &str = "proxy-authorization";
 
 /// Proxy a request to the upstream server and validate the response.
 pub async fn proxy_request(
@@ -34,7 +37,12 @@ pub async fn proxy_request(
         runtime.client.request(method.clone(), target_url).body(body_bytes.to_vec());
     for (name, value) in headers {
         let lower = name.as_str().to_ascii_lowercase();
-        if lower == HEADER_HOST || lower == HEADER_CONTENT_LENGTH {
+        if lower == HEADER_HOST ||
+            lower == HEADER_CONTENT_LENGTH ||
+            lower == HEADER_AUTHORIZATION ||
+            lower == HEADER_COOKIE ||
+            lower == HEADER_PROXY_AUTHORIZATION
+        {
             continue;
         }
         request_builder = request_builder.header(name, value);

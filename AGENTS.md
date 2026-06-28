@@ -30,33 +30,20 @@
 
 When introducing new dependencies, prefer these versions unless compatibility requires an upgrade:
 
-- `clap = "4.5.60"`
-- `config = "0.15.19"`
+- `clap = "4.6.1"`
 - `eyre = "0.6.12"`
+- `hpx = "2.4.24"`
+- `scc = "3.8.3"`
 - `serde = "1.0.228"`
 - `thiserror = "2.0.18"`
-- `tokio = "1.49.0"`
+- `tokio = "1.52.3"`
 - `tracing = "0.1.44"`
-- `tracing-subscriber = "0.3.22"`
-- `tracing-opentelemetry = "0.32.1"`
-- `opentelemetry = "0.31.0"`
-- `opentelemetry-otlp = "0.31.0"`
-- `sqlx = "=0.9.0-alpha.1"`
-- `utoipa = "5.4.0"`
-- `utoipa-swagger-ui = "9.0.2"`
-- `arc-swap = "1.8.2"`
-- `hpx = "2.3.1"`
-- `scc = "3.6.5"`
-- `winnow = "0.7.14"`
-- `shadow-rs = "1.7.0"`
-- `ecdysis = "1.0.1"`
+- `tracing-subscriber = "0.3.23"`
 
 ## Dependency Priority and Forbidden Choices
 
 - HTTP client preference: `hpx` (with `rustls`) over `reqwest`.
 - Concurrent map/set preference: `scc` over `dashmap` and `RwLock<HashMap<...>>`.
-- Parsing preference: `winnow` or `pest` over ad-hoc manual parsing.
-- Read-heavy shared state: `arc-swap` over `RwLock`.
 - Forbidden by default: `anyhow`, `log`, `reqwest`, `dashmap`.
 
 ## Engineering Principles
@@ -66,24 +53,14 @@ When introducing new dependencies, prefer these versions unless compatibility re
 1. Error handling:
    - Application layer: `eyre`.
    - Library layer: `thiserror`.
-2. Database (`sqlx`):
-   - Prefer runtime queries (`sqlx::query_as`).
-   - DB structs should derive `sqlx::FromRow`.
-   - Avoid compile-time `sqlx::query!` macros by default.
-3. Concurrency:
-   - Prefer lock-free/container-first approaches (`scc`, `ArcSwap`).
+2. Concurrency:
+   - Prefer lock-free/container-first approaches (`scc`).
    - Avoid `Arc<Mutex<T>>` when better alternatives are available.
-4. Observability:
+3. Observability:
    - Logging: `tracing` only.
    - Metrics/traces: OpenTelemetry OTLP gRPC.
    - Prometheus should not be the default instrumentation path.
-5. API docs:
-   - Generate OpenAPI with `utoipa` when exposing HTTP APIs.
-6. Configuration:
-   - Use the `config` crate and external configuration files (prefer TOML).
-7. Binaries:
-   - Use `ecdysis` for graceful restart/reload flows in daemon/server binaries.
-8. Safety:
+4. Safety:
    - Use `unsafe` only when strictly necessary and document the safety invariants.
 
 ### Key Design Principles
@@ -175,8 +152,6 @@ After each feature or bug fix, run:
 just format
 just lint
 just test
-just bdd
-just test-all
 ```
 
 If any command fails, report the failure and do not claim completion.

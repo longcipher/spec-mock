@@ -18,13 +18,6 @@ use crate::error::SpecMockCoreError;
 const DEFAULT_MAX_DEPTH: usize = 64;
 const DEFAULT_EXTERNAL_DOC_CACHE_LIMIT: usize = 128;
 
-/// A fully-resolved document where all `$ref` pointers have been inlined.
-#[derive(Debug, Clone)]
-pub struct ResolvedDocument {
-    /// Fully-inlined JSON value (no `$ref` nodes remain).
-    pub root: Value,
-}
-
 /// Synchronous `$ref` resolver that handles local and file-relative references.
 ///
 /// The resolver caches loaded external files to avoid redundant I/O and parses
@@ -96,7 +89,7 @@ impl RefResolver {
 
     /// Load a spec file from `path`, resolve every `$ref`, and return the
     /// fully-inlined document.
-    pub fn resolve(&mut self, path: &Path) -> Result<ResolvedDocument, SpecMockCoreError> {
+    pub fn resolve(&mut self, path: &Path) -> Result<Value, SpecMockCoreError> {
         let canonical = std::fs::canonicalize(path).map_err(|e| {
             SpecMockCoreError::Ref(format!("cannot canonicalize {}: {e}", path.display()))
         })?;
@@ -110,7 +103,7 @@ impl RefResolver {
         let parent = canonical.parent().unwrap_or(&self.base_dir).to_path_buf();
         self.resolve_value(&mut root, &root_snapshot, &parent, 0)?;
 
-        Ok(ResolvedDocument { root })
+        Ok(root)
     }
 
     /// Resolve a pre-parsed [`Value`] tree in-place, using `base_dir` as the
@@ -305,7 +298,7 @@ fn split_ref(ref_str: &str) -> (&str, &str) {
 ///
 /// The pointer must start with `/` (the leading `/` is stripped before
 /// splitting). Returns `None` when the path cannot be followed.
-fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
+pub fn resolve_pointer(root: &Value, pointer: &str) -> Option<Value> {
     if pointer.is_empty() || pointer == "/" {
         return Some(root.clone());
     }
@@ -426,7 +419,7 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("resolve");
 
-        let schema = &resolved.root["paths"]["/pets"]["get"]["responses"]["200"]["content"]["application/json"]
+        let schema = &resolved["paths"]["/pets"]["get"]["responses"]["200"]["content"]["application/json"]
             ["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["name"]["type"], "string");
@@ -470,7 +463,7 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("resolve");
 
-        let schema = &resolved.root["paths"]["/pets"]["get"]["responses"]["200"]["schema"];
+        let schema = &resolved["paths"]["/pets"]["get"]["responses"]["200"]["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["id"]["type"], "integer");
     }
@@ -497,7 +490,7 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("resolve");
 
-        let pet = &resolved.root["definitions"]["pet"];
+        let pet = &resolved["definitions"]["pet"];
         assert_eq!(pet["type"], "object");
         assert_eq!(pet["properties"]["name"]["type"], "string");
     }
@@ -599,8 +592,8 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("resolve");
 
-        assert_eq!(resolved.root["result"]["type"], "string");
-        assert_eq!(resolved.root["result"]["example"], "deep");
+        assert_eq!(resolved["result"]["type"], "string");
+        assert_eq!(resolved["result"]["example"], "deep");
     }
 
     // ── Sibling property preservation ──────────────────────────────────
@@ -633,7 +626,7 @@ mod tests {
         let mut resolver = RefResolver::new(tmp.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("resolve");
 
-        let schema = &resolved.root["paths"]["/pets"]["schema"];
+        let schema = &resolved["paths"]["/pets"]["schema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["description"], "A pet object");
     }
@@ -726,7 +719,7 @@ mod tests {
             .with_allowed_root(outside.path().to_path_buf());
         let resolved = resolver.resolve(&main_file).expect("should allow external ref");
         assert_eq!(
-            resolved.root["paths"]["/pets"]["get"]["responses"]["200"]["schema"]["type"],
+            resolved["paths"]["/pets"]["get"]["responses"]["200"]["schema"]["type"],
             "object"
         );
     }

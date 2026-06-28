@@ -52,6 +52,9 @@ struct ServeArgs {
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = 10_485_760)]
     max_body_size: usize,
+    /// Allow private/link-local/loopback upstream URLs in proxy mode.
+    #[arg(long)]
+    allow_private_upstream: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -88,7 +91,8 @@ async fn serve_command(args: ServeArgs) -> Result<(), eyre::Report> {
         .mode(args.mode.into_runtime_mode())
         .http_addr(args.http_addr)
         .grpc_addr(args.grpc_addr)
-        .max_body_size(args.max_body_size);
+        .max_body_size(args.max_body_size)
+        .allow_private_upstream(args.allow_private_upstream);
 
     if let Some(openapi) = args.openapi {
         builder = builder.openapi(openapi);

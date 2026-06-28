@@ -7,7 +7,7 @@ pub mod ref_resolver;
 pub mod schema;
 pub mod validate;
 
-pub use contract::{MockMode, Protocol, ValidationDirection};
+pub use contract::MockMode;
 pub use error::{PROBLEM_JSON_CONTENT_TYPE, ProblemDetails, SpecMockCoreError, ValidationIssue};
 
 #[cfg(test)]

@@ -164,7 +164,7 @@ fn generate_array(
     rng: &mut ChaCha8Rng,
     depth: usize,
 ) -> Result<Value, SpecMockCoreError> {
-    let min_items = schema.get("minItems").and_then(Value::as_u64).unwrap_or(1).min(3);
+    let min_items = schema.get("minItems").and_then(Value::as_u64).unwrap_or(1).min(100);
     let max_items = schema
         .get("maxItems")
         .and_then(Value::as_u64)
@@ -189,7 +189,7 @@ fn generate_array(
 
 fn generate_integer(schema: &Value, rng: &mut ChaCha8Rng) -> Value {
     let min = schema.get("minimum").and_then(Value::as_i64).unwrap_or(0);
-    let max = schema.get("maximum").and_then(Value::as_i64).unwrap_or(min + 100);
+    let max = schema.get("maximum").and_then(Value::as_i64).unwrap_or(min.saturating_add(100));
     let bounded_max = max.max(min);
     Value::from(rng.random_range(min..=bounded_max))
 }
@@ -236,12 +236,12 @@ fn generate_string(schema: &Value, rng: &mut ChaCha8Rng) -> Value {
         return Value::String(value);
     }
 
-    let min_length = schema.get("minLength").and_then(Value::as_u64).unwrap_or(1).min(64);
+    let min_length = schema.get("minLength").and_then(Value::as_u64).unwrap_or(1).min(10000);
     let max_length = schema
         .get("maxLength")
         .and_then(Value::as_u64)
         .unwrap_or(min_length + 8)
-        .min(64)
+        .min(10000)
         .max(min_length);
     let len = rng.random_range(min_length..=max_length);
     let generated: String = (0..len)
@@ -602,6 +602,29 @@ mod tests {
     }
 
     #[test]
+    fn test_faker_respects_min_items() {
+        let schema = json!({
+            "type": "array",
+            "minItems": 10,
+            "items": {"type": "string"}
+        });
+        let result = generate_json_value(&schema, 42).unwrap();
+        assert!(result.is_array());
+        assert!(result.as_array().unwrap().len() >= 10);
+    }
+
+    #[test]
+    fn test_faker_respects_min_length() {
+        let schema = json!({
+            "type": "string",
+            "minLength": 200
+        });
+        let result = generate_json_value(&schema, 42).unwrap();
+        assert!(result.is_string());
+        assert!(result.as_str().unwrap().len() >= 200);
+    }
+
+    #[test]
     fn additional_properties_false_generates_no_extras() {
         let schema = json!({
             "type": "object",
@@ -616,5 +639,15 @@ mod tests {
         let obj = result.as_object().expect("should be object");
         let extra_count = obj.keys().filter(|k| k.starts_with("extra_")).count();
         assert_eq!(extra_count, 0, "should not generate extras when false");
+    }
+
+    #[test]
+    fn test_integer_faker_no_overflow() {
+        let schema = json!({
+            "type": "integer",
+            "minimum": 9223372036854775707_i64
+        });
+        let result = generate_json_value(&schema, 42).unwrap();
+        assert!(result.is_number());
     }
 }

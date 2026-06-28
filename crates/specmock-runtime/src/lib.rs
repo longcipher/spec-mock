@@ -24,6 +24,14 @@ const DEFAULT_WS_PATH: &str = "/ws";
 /// Default deterministic seed.
 const DEFAULT_SEED: u64 = 42;
 
+const FOLD_HASH_MULTIPLIER: u64 = 131;
+
+pub fn deterministic_hash(seed: u64, input: &str) -> u64 {
+    seed ^ input.bytes().fold(0_u64, |acc, byte| {
+        acc.wrapping_mul(FOLD_HASH_MULTIPLIER).wrapping_add(u64::from(byte))
+    })
+}
+
 /// Runtime configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -47,6 +55,8 @@ pub struct ServerConfig {
     pub ws_path: String,
     /// Maximum request body size in bytes (default 10 MiB).
     pub max_body_size: usize,
+    /// Allow private/link-local/loopback upstream URLs in proxy mode.
+    pub allow_private_upstream: bool,
 }
 
 impl Default for ServerConfig {
@@ -62,6 +72,7 @@ impl Default for ServerConfig {
             grpc_addr: SocketAddr::from(DEFAULT_GRPC_ADDR),
             ws_path: DEFAULT_WS_PATH.to_owned(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
+            allow_private_upstream: false,
         }
     }
 }
@@ -83,6 +94,35 @@ impl ServerConfig {
             return Err(RuntimeError::Config(
                 "proxy mode requires upstream base URL (--upstream)".to_owned(),
             ));
+        }
+
+        // Reject non-HTTP upstream schemes to prevent SSRF
+        if let Some(ref upstream) = self.upstream {
+            match url::Url::parse(upstream) {
+                Ok(parsed) => {
+                    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                        return Err(RuntimeError::Config(format!(
+                            "upstream URL must use http or https scheme, got: {}",
+                            parsed.scheme()
+                        )));
+                    }
+
+                    // Reject private/link-local/loopback upstream unless explicitly allowed
+                    if self.mode == MockMode::Proxy &&
+                        !self.allow_private_upstream &&
+                        let Some(host) = parsed.host_str() &&
+                        let Ok(ip) = host.parse::<std::net::IpAddr>() &&
+                        is_private_ip(ip)
+                    {
+                        return Err(RuntimeError::Config(
+                            "upstream URL must not point to a private, loopback, or link-local address (use --allow-private-upstream to override)".to_owned(),
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return Err(RuntimeError::Config(format!("invalid upstream URL: {e}")));
+                }
+            }
         }
 
         // Check that HTTP and gRPC addresses are not the same
@@ -137,6 +177,16 @@ impl ServerConfig {
     }
 }
 
+/// Check if an IP address is loopback, private (RFC 1918), or link-local.
+fn is_private_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || (v4.octets()[0] == 169 && v4.octets()[1] == 254)
+        }
+        std::net::IpAddr::V6(v6) => v6.is_loopback(),
+    }
+}
+
 /// Runtime handle.
 #[derive(Debug)]
 pub struct RunningServer {
@@ -183,6 +233,84 @@ pub enum RuntimeError {
     /// Serialization / parsing error.
     #[error("parse error: {0}")]
     Parse(String),
+    /// Requested response not found.
+    #[error("not found: {0}")]
+    NotFound(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reject_file_upstream_scheme() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            mode: MockMode::Proxy,
+            upstream: Some("file:///etc/passwd".into()),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("should reject file:// scheme");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("http") || msg.contains("scheme"),
+            "error should mention scheme/http, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_private_upstream_by_default() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            mode: MockMode::Proxy,
+            upstream: Some("http://127.0.0.1:9999".into()),
+            allow_private_upstream: false,
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("should reject loopback upstream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("private") || msg.contains("loopback"),
+            "error should mention private/loopback, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn reject_link_local_upstream_by_default() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            mode: MockMode::Proxy,
+            upstream: Some("http://169.254.169.254/latest/meta-data".into()),
+            allow_private_upstream: false,
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("should reject link-local upstream");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("private") || msg.contains("loopback") || msg.contains("link-local"),
+            "error should mention private/loopback/link-local, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn allow_private_upstream_when_flag_set() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            mode: MockMode::Proxy,
+            upstream: Some("http://127.0.0.1:9999".into()),
+            allow_private_upstream: true,
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "should allow private upstream when flag is set");
+    }
 }
 
 /// Start protocol runtimes.
