@@ -140,11 +140,10 @@ When fixing failures, identify root cause first, then apply idiomatic fixes inst
 Use outside-in development for behavior changes:
 
 - **Git Restrictions:** NEVER use `git worktree`. All code modifications MUST be made directly on the current branch in the existing working directory.
-- start with a failing Gherkin scenario under `features/`,
+- start with a failing crate-local unit or integration test that names the expected behavior,
 - drive implementation with failing crate-local unit tests and `proptest` properties in the affected crate,
 - keep `proptest` in the normal `cargo test` loop instead of creating a separate property-test command,
-- treat `cargo-fuzz` as conditional planning work rather than baseline template setup,
-- keep `cucumber-rs` steps thin and route business rules through shared Rust crates.
+- treat `cargo-fuzz` as conditional planning work rather than baseline template setup.
 
 After each feature or bug fix, run:
 
@@ -158,8 +157,6 @@ If any command fails, report the failure and do not claim completion.
 
 ## Testing Requirements
 
-- BDD scenarios: place Gherkin features under `features/` and keep the runner in crate-level `tests/` with `cucumber-rs`.
-- Use BDD to define acceptance behavior first, then use crate-local unit tests and `proptest` properties for the inner TDD loop.
 - Unit tests: colocate with implementation (`#[cfg(test)]`).
 - Prefer example-based unit tests for named business cases and edge cases, and reserve `proptest` for invariants that should hold across many generated inputs.
 - Property tests: colocate `proptest` coverage with the crate logic it exercises so it runs through the ordinary `cargo test` path.

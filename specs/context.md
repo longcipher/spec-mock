@@ -52,7 +52,6 @@ Additional tooling:
 - **Integration Tests:** `crates/specmock-runtime/tests/{http_openapi,ws_asyncapi,grpc_protobuf,prism_comparison}.rs`
 - **SDK Tests:** `crates/specmock-sdk/tests/{sdk_embed,sdk_process}.rs`
 - **Test Harness:** `crates/specmock-runtime/tests/harness/{mod,fuzzer,comparator,prism,request}.rs`
-- **BDD:** No `.feature` files exist — this is a gap
 - **Total:** 145 passing tests, 11 ignored (integration tests requiring Prism)
 
 ## Git History Signal

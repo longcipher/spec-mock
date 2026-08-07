@@ -18,7 +18,7 @@ The SSRF findings (#2, #3) are exploitable in any deployment where the mock serv
 
 ## Approach
 
-Fix in priority order: security first (SSRF, header leak, path leak), then correctness (gRPC depth, faker, content-type, Prefer, callback, determinism, ws_url), then performance (validator cache, normalize_schema), then tech debt (deduplication, dead code), then DX (AGENTS.md, BDD). Each finding is a self-contained change with its own test.
+Fix in priority order: security first (SSRF, header leak, path leak), then correctness (gRPC depth, faker, content-type, Prefer, callback, determinism, ws_url), then performance (validator cache, normalize_schema), then tech debt (deduplication, dead code), then DX (AGENTS.md). Each finding is a self-contained change with its own test.
 
 ## Findings
 
@@ -330,11 +330,11 @@ Fix in priority order: security first (SSRF, header leak, path leak), then corre
 
 #### Current state
 
-- `AGENTS.md` — references `just bdd` and `just test-all` (don't exist), preferred versions diverge from Cargo.toml, lists unused dependencies.
+- `AGENTS.md` — preferred versions diverge from Cargo.toml, lists unused dependencies.
 
 #### Approach
 
-- Remove phantom commands, update versions to match Cargo.toml, trim unused dependency guidance.
+- Update versions to match Cargo.toml, trim unused dependency guidance.
 
 ### Finding 21: Validator cache key serializes full schema JSON
 
@@ -349,22 +349,6 @@ Fix in priority order: security first (SSRF, header leak, path leak), then corre
 #### Approach
 
 - Hash the schema value and use the hash as cache key.
-
-### Finding 22: No BDD feature files
-
-- **Category:** tests
-- **Impact:** MED — no acceptance-level behavioral specs
-- **Effort:** L
-
-#### Current state
-
-- Zero `.feature` files in the repository.
-
-#### Approach
-
-- Create `features/` directory with Gherkin files for core behaviors.
-- Implement `cucumber-rs` step definitions.
-- Wire to existing server test harness.
 
 ## Code Simplification Constraints
 
@@ -387,30 +371,6 @@ Fix in priority order: security first (SSRF, header leak, path leak), then corre
 - **Repo Standards:** Use only the coding standards established by `AGENTS.md` and the existing codebase.
 - **Readability Priorities:** Prefer explicit control flow, clear names, reduced nesting.
 - **Refactor Scope:** Limit cleanup to touched modules unless the design explicitly justifies broader refactor.
-
-## BDD Scenario Inventory
-
-- `features/correctness.feature` — Recursive protobuf does not crash: server stays alive → Task 1.1
-- `features/correctness.feature` — Faker enum varies by seed: deterministic enum selection → Task 4.1
-- `features/correctness.feature` — Faker respects minItems/minLength: generated data validates → Task 5.1
-- `features/correctness.feature` — Integer faker no overflow: no panic near i64::MAX → Task 6.1
-- `features/correctness.feature` — Non-JSON content type rejected: no wrong schema applied → Task 7.1
-- `features/correctness.feature` — Prefer missing code returns error: no silent fallback → Task 8.1
-- `features/correctness.feature` — Callback URL handles non-body tokens: graceful resolution → Task 11.1
-- `features/correctness.feature` — Named examples deterministic: same seed same result → Task 12.1
-- `features/correctness.feature` — SDK ws_url uses configured path: correct URL → Task 17.1
-- `features/security.feature` — Proxy rejects non-HTTP upstream: no file:// SSRF → Task 2.1
-- `features/security.feature` — Proxy rejects private upstream: no metadata SSRF → Task 2.2
-- `features/security.feature` — Callback URL validated: no arbitrary outbound → Task 3.1
-- `features/security.feature` — Proxy strips auth headers: no credential leak → Task 9.1
-- `features/security.feature` — Error paths sanitized: no filesystem disclosure → Task 10.1
-- `features/performance.feature` — Validator cache uses hashed keys: faster validation → Task 21.1
-- `features/tech-debt.feature` — Hash function shared: single implementation → Task 13.1
-- `features/tech-debt.feature` — JSON Pointer shared: single implementation → Task 14.1
-- `features/tech-debt.feature` — Dead code removed: cleaner exports → Task 15.1
-- `features/tech-debt.feature` — ResolvedDocument eliminated: simpler API → Task 16.1
-- `features/dx.feature` — AGENTS.md matches project: correct guidance → Task 20.1
-- `features/dx.feature` — BDD features exist: acceptance criteria → Task 22.1
 
 ## Verification
 
