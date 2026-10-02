@@ -238,6 +238,40 @@ pub enum RuntimeError {
     NotFound(String),
 }
 
+/// Start protocol runtimes.
+pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> {
+    config.validate()?;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let shared_shutdown = Arc::new(tokio::sync::Notify::new());
+
+    let http_runtime = http::HttpRuntime::from_config(&config).await?;
+    let (http_addr, http_task) =
+        http::spawn_http_server(http_runtime, config.http_addr, Arc::clone(&shared_shutdown))
+            .await?;
+
+    let mut tasks = vec![http_task];
+    let mut grpc_addr = None;
+
+    if config.proto_spec.is_some() {
+        let grpc_runtime = grpc::GrpcRuntime::from_config(&config).await?;
+        let (bound_grpc_addr, grpc_task) =
+            grpc::spawn_grpc_server(grpc_runtime, config.grpc_addr, Arc::clone(&shared_shutdown))
+                .await?;
+        grpc_addr = Some(bound_grpc_addr);
+        tasks.push(grpc_task);
+    }
+
+    // Relay oneshot shutdown to notify-based shutdown for all tasks.
+    let relay_notify = Arc::clone(&shared_shutdown);
+    tasks.push(tokio::spawn(async move {
+        let _ignored = shutdown_rx.await;
+        relay_notify.notify_waiters();
+    }));
+
+    Ok(RunningServer { http_addr, grpc_addr, shutdown_tx: Some(shutdown_tx), tasks })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,38 +345,4 @@ mod tests {
         };
         assert!(config.validate().is_ok(), "should allow private upstream when flag is set");
     }
-}
-
-/// Start protocol runtimes.
-pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> {
-    config.validate()?;
-
-    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-    let shared_shutdown = Arc::new(tokio::sync::Notify::new());
-
-    let http_runtime = http::HttpRuntime::from_config(&config).await?;
-    let (http_addr, http_task) =
-        http::spawn_http_server(http_runtime, config.http_addr, Arc::clone(&shared_shutdown))
-            .await?;
-
-    let mut tasks = vec![http_task];
-    let mut grpc_addr = None;
-
-    if config.proto_spec.is_some() {
-        let grpc_runtime = grpc::GrpcRuntime::from_config(&config).await?;
-        let (bound_grpc_addr, grpc_task) =
-            grpc::spawn_grpc_server(grpc_runtime, config.grpc_addr, Arc::clone(&shared_shutdown))
-                .await?;
-        grpc_addr = Some(bound_grpc_addr);
-        tasks.push(grpc_task);
-    }
-
-    // Relay oneshot shutdown to notify-based shutdown for all tasks.
-    let relay_notify = Arc::clone(&shared_shutdown);
-    tasks.push(tokio::spawn(async move {
-        let _ignored = shutdown_rx.await;
-        relay_notify.notify_waiters();
-    }));
-
-    Ok(RunningServer { http_addr, grpc_addr, shutdown_tx: Some(shutdown_tx), tasks })
 }
