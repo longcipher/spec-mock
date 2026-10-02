@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package mock;
+
+service Inventory {
+  rpc Lookup(LookupRequest) returns (Item);
+}
+
+message LookupRequest {
+  string sku = 1;
+}
+
+message Item {
+  string name = 1;
+  Condition condition = 2;
+  Condition secondary_condition = 3;
+}
+
+enum Condition {
+  CONDITION_UNSPECIFIED = 0;
+  CONDITION_NEW = 1;
+  CONDITION_REFURBISHED = 2;
+  CONDITION_DAMAGED = 3;
+}

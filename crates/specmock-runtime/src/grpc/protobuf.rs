@@ -16,6 +16,8 @@ use http_body::Frame;
 use http_body_util::BodyExt;
 use prost::Message;
 use prost_reflect::{Cardinality, DescriptorPool, DynamicMessage, Kind, MethodDescriptor, Value};
+use rand::{RngExt, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde_json::json;
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -585,9 +587,13 @@ fn scalar_value_for_field(kind: &Kind, seed: u64, depth: usize) -> Result<Value,
         Kind::String => Ok(Value::String(format!("mock-{seed}"))),
         Kind::Bytes => Ok(Value::Bytes(bytes::Bytes::from(format!("mock-{seed}")))),
         Kind::Enum(enum_descriptor) => {
-            let first =
-                enum_descriptor.values().next().ok_or_else(|| "enum has no values".to_owned())?;
-            Ok(Value::EnumNumber(first.number()))
+            let values: Vec<_> = enum_descriptor.values().collect();
+            if values.is_empty() {
+                return Err("enum has no values".to_owned());
+            }
+            let mut rng = ChaCha8Rng::seed_from_u64(seed);
+            let index = rng.random_range(0..values.len());
+            Ok(Value::EnumNumber(values[index].number()))
         }
         Kind::Message(message_descriptor) => {
             let nested = generate_dynamic_message(message_descriptor.clone(), seed + 1, depth + 1)?;

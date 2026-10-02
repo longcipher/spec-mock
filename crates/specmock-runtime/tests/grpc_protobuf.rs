@@ -65,6 +65,26 @@ fn streaming_proto_spec_path() -> PathBuf {
         .join("greeter-streaming.proto")
 }
 
+fn enum_proto_spec_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests").join("specs").join("enum-service.proto")
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct LookupRequest {
+    #[prost(string, tag = "1")]
+    sku: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct Item {
+    #[prost(string, tag = "1")]
+    name: String,
+    #[prost(int32, tag = "2")]
+    condition: i32,
+    #[prost(int32, tag = "3")]
+    secondary_condition: i32,
+}
+
 #[derive(Clone, PartialEq, Message)]
 struct HelloRequest {
     #[prost(string, tag = "1")]
@@ -228,6 +248,109 @@ async fn grpc_method_not_found_returns_status_12() -> Result<(), Box<dyn std::er
 }
 
 // --- helpers ---
+
+/// Boot a server with an explicit deterministic seed.
+async fn boot_server_with_seed(
+    proto_path: PathBuf,
+    seed: u64,
+) -> Result<(SocketAddr, specmock_runtime::RunningServer), Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        proto_spec: Some(proto_path),
+        mode: MockMode::Mock,
+        seed,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        grpc_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err("permission denied – skipping".into());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    let grpc_addr = server.grpc_addr.ok_or("grpc address was not bound")?;
+    Ok((grpc_addr, server))
+}
+
+/// Call `mock.Inventory/Lookup` and return the mocked item.
+async fn lookup_item(grpc_addr: SocketAddr) -> Result<Item, Box<dyn std::error::Error>> {
+    let channel =
+        tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))?.connect().await?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client.ready().await?;
+
+    let codec: TestProstCodec<LookupRequest, Item> = TestProstCodec::default();
+    let path = http::uri::PathAndQuery::from_static("/mock.Inventory/Lookup");
+
+    let response: tonic::Response<Item> = client
+        .unary(tonic::Request::new(LookupRequest { sku: "A-1".to_owned() }), path, codec)
+        .await?;
+    Ok(response.into_inner())
+}
+
+#[tokio::test]
+async fn grpc_enum_fields_are_seed_varied() -> Result<(), Box<dyn std::error::Error>> {
+    // Two enum fields per message make a "always pick the first value" bug
+    // visible in a single response, and distinct seeds broaden the sample.
+    let mut observed: Vec<(i32, i32)> = Vec::new();
+
+    for seed in [1_u64, 7, 42, 99, 2024] {
+        let (grpc_addr, server) = match boot_server_with_seed(enum_proto_spec_path(), seed).await {
+            Ok(pair) => pair,
+            Err(_) => return Ok(()),
+        };
+
+        let item = lookup_item(grpc_addr).await?;
+        observed.push((item.condition, item.secondary_condition));
+        server.shutdown().await;
+    }
+
+    for (condition, _secondary) in &observed {
+        assert!(
+            (0..=3).contains(condition),
+            "enum value must be a declared Condition, got {condition}"
+        );
+    }
+
+    let distinct: std::collections::BTreeSet<i32> =
+        observed.iter().map(|(condition, _)| *condition).collect();
+    assert!(
+        distinct.len() > 1,
+        "mocked protobuf enum values must vary with the seed, got {observed:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn grpc_enum_generation_is_deterministic_for_a_seed() -> Result<(), Box<dyn std::error::Error>>
+{
+    let first = match boot_server_with_seed(enum_proto_spec_path(), 4242).await {
+        Ok(pair) => pair,
+        Err(_) => return Ok(()),
+    };
+    let first_item = lookup_item(first.0).await?;
+    first.1.shutdown().await;
+
+    let second = match boot_server_with_seed(enum_proto_spec_path(), 4242).await {
+        Ok(pair) => pair,
+        Err(_) => return Ok(()),
+    };
+    let second_item = lookup_item(second.0).await?;
+    second.1.shutdown().await;
+
+    assert_eq!(
+        first_item.condition, second_item.condition,
+        "the same seed must reproduce the same mocked enum value"
+    );
+    assert_eq!(
+        first_item.secondary_condition, second_item.secondary_condition,
+        "the same seed must reproduce the same mocked enum value"
+    );
+    Ok(())
+}
 
 fn encode_grpc_unary_frame(payload: &[u8]) -> Vec<u8> {
     let length = payload.len() as u32;

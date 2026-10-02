@@ -35,6 +35,8 @@ hyper-util = { workspace = true, features = [
 prost = { workspace = true }
 prost-reflect = { workspace = true }
 protox = { workspace = true }
+rand.workspace = true
+rand_chacha.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 specmock-core = { workspace = true }
