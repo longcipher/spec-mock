@@ -42,7 +42,7 @@ Additional tooling:
 | Module | Purpose | Key Files |
 |--------|---------|-----------|
 | specmock-core | Core types, schema validation, $ref resolution, deterministic faker | `crates/specmock-core/src/{lib,error,contract,schema,validate,ref_resolver,faker}.rs` |
-| specmock-runtime | HTTP (OpenAPI), WebSocket (AsyncAPI), gRPC (Protobuf) mock servers | `crates/specmock-runtime/src/{lib,http/{mod,openapi,router,negotiate,proxy,ws_handler},ws/{mod,asyncapi},grpc/{mod,protobuf}}.rs` |
+| specmock-runtime | HTTP (OpenAPI), WebSocket (AsyncAPI), gRPC (Protobuf) mock servers | `crates/specmock-runtime/src/{lib,http/{mod,openapi,router,negotiate,media,proxy,ws_handler},ws/{mod,asyncapi},grpc/{mod,protobuf}}.rs` |
 | specmock-sdk | Rust SDK for embedding mock server in tests (in-process + process mode) | `crates/specmock-sdk/src/{lib,server}.rs` |
 | spec-mock (bin) | CLI entrypoint (`spec-mock serve`) | `bin/spec-mock/src/main.rs` |
 
@@ -52,7 +52,7 @@ Additional tooling:
 - **Integration Tests:** `crates/specmock-runtime/tests/{http_openapi,ws_asyncapi,grpc_protobuf,prism_comparison}.rs`
 - **SDK Tests:** `crates/specmock-sdk/tests/{sdk_embed,sdk_process}.rs`
 - **Test Harness:** `crates/specmock-runtime/tests/harness/{mod,fuzzer,comparator,prism,request}.rs`
-- **Total:** 145 passing tests, 11 ignored (integration tests requiring Prism)
+- **Total:** 223 passing tests, 11 ignored (integration tests requiring Prism)
 
 ## Git History Signal
 
@@ -67,4 +67,6 @@ Additional tooling:
 - **$ref resolver:** Supports local JSON pointer and file-relative refs with allowed-root sandboxing and LRU cache
 - **RFC 7807 errors:** All error responses use `application/problem+json` format
 - **Prefer header:** Supports `code=`, `example=`, `dynamic=true` directives for response selection
+- **Media types:** `http::media` classifies media types and encodes bodies (JSON/XML/text/binary); `Accept` negotiation returns `406` when unsatisfiable
+- **Response headers:** Declared response headers are emitted from `example` or the faker
 - **Fire-and-forget callbacks:** OpenAPI callbacks are spawned as detached tokio tasks

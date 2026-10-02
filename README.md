@@ -25,6 +25,8 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 | `Prefer: example=xxx` header         |     ✅     |   ✅   |
 | `Prefer: dynamic=true` header        |     ✅     |   ✅   |
 | Content negotiation (`Accept`)       |     ✅     |   ✅   |
+| Non-JSON response media types        |     ✅     |   ✅   |
+| Declared response headers            |     ✅     |   ✅   |
 | RFC 7807 Problem Details errors      |     ✅     |   ✅   |
 | Request body validation              |     ✅     |   ✅   |
 | Query/path/header param validation   |     ✅     |   ✅   |
@@ -38,22 +40,30 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 | Rust SDK (embed in tests)            |     ✅     |   ❌   |
 | Configurable body size limit         |     ✅     |   ❌   |
 | Content-Type validation (415)        |     ✅     |   ❌   |
+| Content negotiation (406)            |     ✅     |   ❌   |
+| Configurable WebSocket path          |     ✅     |   ❌   |
 
 ## Capability Summary
 
 - Request validation against spec schema.
 - RFC 7807 `application/problem+json` error responses with structured validation details.
 - Response generation priority: `example` → `examples[0]` → `default` → deterministic schema faker.
-- Faker supports: `pattern` (regex), all standard `format` values, `discriminator` + `mapping`, `additionalProperties`, `default` values.
+- Content negotiation via the `Accept` header across every declared media type; an
+  unsatisfiable `Accept` returns `406`. Without `Accept`, the JSON family is preferred.
+- Response body encoding per media type: compact JSON, XML (with schema-derived root
+  element), raw text, and raw binary payloads.
+- Declared response headers are emitted, using `example` when present and the faker otherwise.
+- Faker supports: `pattern` (regex), all standard `format` values, seeded `enum` and
+  `oneOf`/`anyOf` variant selection, `discriminator` + `mapping`, `additionalProperties`,
+  `default` values.
 - Proxy mode for HTTP: forwards upstream response and validates it against OpenAPI response schema.
 - `Prefer` header: select response by status code, named example, or force dynamic generation.
-- Content negotiation via `Accept` header.
 - Multi-value query parameters with `style`/`explode` support.
 - Callback/webhook firing on matched operations (fire-and-forget).
 - Configurable request body size limit (default 10 MiB, 413 on exceeded).
-- Content-Type validation returns 415 for unsupported media types.
+- Content-Type validation returns 415 for media types the operation does not declare.
 - gRPC error metadata includes `grpc-status-details-bin` plus `grpc-message` and `grpc-status`.
-- AsyncAPI v2 and v3 with multi-path WebSocket routing.
+- AsyncAPI v2 and v3 with multi-path WebSocket routing on a configurable base path.
 
 ## Quick Start (CLI)
 
@@ -120,6 +130,50 @@ Combine preferences:
 curl -H "Prefer: code=200, example=fluffy" http://127.0.0.1:4010/pets/1
 ```
 
+A preference that cannot be satisfied is reported instead of being silently ignored:
+`Prefer: code=418` on a spec without an `418` response returns `404`, and
+`Prefer: example=nope` on a response without that named example returns `404`.
+
+#### Content Negotiation
+
+The `Accept` header selects among all media types declared for the selected response. Using
+the bundled `docs/specs/reports.openapi.yaml` example:
+
+```bash
+cargo run -p spec-mock -- serve \
+  --openapi docs/specs/reports.openapi.yaml \
+  --http-addr 127.0.0.1:4010
+
+curl -H "Accept: application/json" http://127.0.0.1:4010/report
+curl -H "Accept: text/plain" http://127.0.0.1:4010/report
+curl -H "Accept: application/xml" http://127.0.0.1:4010/inventory
+```
+
+Response bodies are encoded per media type:
+
+| Media type family                          | Body                                                    |
+| ------------------------------------------ | ------------------------------------------------------- |
+| `application/json`, `*+json`               | compact JSON                                             |
+| `application/xml`, `text/xml`, `*+xml`     | XML document rooted at `xml.name` / `title` / `root`      |
+| `text/*`, `application/yaml`, …            | the string value verbatim, otherwise JSON                |
+| `image/*`, `application/octet-stream`, …   | the string value verbatim, otherwise JSON                |
+
+An `Accept` header that matches none of the declared media types returns `406`:
+
+```bash
+curl -i -H "Accept: application/vnd.custom+report" http://127.0.0.1:4010/report
+```
+
+Declared response headers are emitted when their status is selected:
+
+```bash
+curl -i -H "Prefer: code=429" http://127.0.0.1:4010/limited
+```
+
+Requests are checked the same way: a non-empty body whose `Content-Type` is not declared by
+the operation returns `415`, and only `application/json` bodies are schema-validated.
+Non-JSON bodies satisfy `requestBody.required` but are not parsed.
+
 ### 2. AsyncAPI WebSocket mock server
 
 Supports both AsyncAPI v2.x and v3.x specs.
@@ -131,6 +185,17 @@ cargo run -p spec-mock -- serve \
 ```
 
 WebSocket endpoint: `ws://127.0.0.1:4011/ws`
+
+Use `--ws-path` to move the WebSocket endpoint:
+
+```bash
+cargo run -p spec-mock -- serve \
+  --asyncapi docs/specs/chat.asyncapi.yaml \
+  --ws-path /socket
+```
+
+Per-channel endpoints are derived from the base path, so the example above also serves
+`ws://127.0.0.1:4011/socket/chat.send`.
 
 Input envelope options:
 
@@ -185,7 +250,9 @@ Options:
   --seed <SEED>           Deterministic data seed [default: 42]
   --http-addr <ADDR>      HTTP bind address [default: 127.0.0.1:4010]
   --grpc-addr <ADDR>      gRPC bind address [default: 127.0.0.1:5010]
+  --ws-path <PATH>        WebSocket base path [default: /ws]
   --max-body-size <BYTES> Maximum request body size in bytes [default: 10485760]
+  --allow-private-upstream  Allow private/loopback/link-local proxy upstreams
 ```
 
 ## Rust SDK
@@ -209,6 +276,24 @@ async fn mock_server_for_test() -> Result<(), Box<dyn std::error::Error>> {
     server.shutdown().await;
     Ok(())
 }
+```
+
+`MockServer::ws_url()` reflects the configured WebSocket path, so AsyncAPI specs can be
+served on any route:
+
+```rust
+# use specmock_sdk::MockServer;
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let server = MockServer::builder()
+    .asyncapi("docs/specs/chat.asyncapi.yaml")
+    .ws_path("/socket")
+    .start()
+    .await?;
+
+assert!(server.ws_url().ends_with("/socket"));
+server.shutdown().await;
+# Ok(())
+# }
 ```
 
 ### Start as an external process
@@ -282,10 +367,12 @@ SPECMOCK_FUZZ_SEED=123 SPECMOCK_FUZZ_ITERATIONS=20 just integration-test
 **Known behavioral divergences:**
 
 - Wrong Content-Type handling: spec-mock returns `415 Unsupported Media Type`; Prism returns `422` or `400`. Both are valid 4xx responses. This divergence is documented and expected.
+- Unsatisfiable `Accept`: spec-mock returns `406 Not Acceptable`; Prism falls back to the first declared media type.
 
 ## Example Specs
 
 - OpenAPI: `docs/specs/pets.openapi.yaml`
+- OpenAPI (media types): `docs/specs/reports.openapi.yaml`
 - AsyncAPI: `docs/specs/chat.asyncapi.yaml`
 - Protobuf: `docs/specs/greeter.proto`
 

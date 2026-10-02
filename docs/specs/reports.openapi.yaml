@@ -1,0 +1,88 @@
+openapi: 3.1.0
+info:
+  title: Report API
+  version: "1.0.0"
+  description: Example spec demonstrating media-type negotiation and declared response headers.
+paths:
+  /report:
+    get:
+      operationId: getReport
+      summary: Fetch the monthly report as JSON or plain text
+      responses:
+        "200":
+          description: monthly report
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [title, rows]
+                properties:
+                  title:
+                    type: string
+                  rows:
+                    type: array
+                    items:
+                      type: integer
+              example:
+                title: "Monthly Report"
+                rows: [10, 20, 30]
+            text/plain:
+              schema:
+                type: string
+              example: "Monthly Report: 10,20,30"
+  /inventory:
+    get:
+      operationId: getInventory
+      summary: Fetch inventory as JSON or XML
+      responses:
+        "200":
+          description: inventory snapshot
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sku, quantity]
+                properties:
+                  sku:
+                    type: string
+                  quantity:
+                    type: integer
+              example:
+                sku: "A-1"
+                quantity: 4
+            application/xml:
+              schema:
+                type: object
+                xml:
+                  name: Inventory
+                required: [sku, quantity]
+                properties:
+                  sku:
+                    type: string
+                  quantity:
+                    type: integer
+  /limited:
+    get:
+      operationId: getRateLimited
+      summary: Trigger the rate-limited response to inspect declared response headers
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                ok: true
+        "429":
+          description: rate limited
+          headers:
+            X-RateLimit-Remaining:
+              description: Requests remaining in the current window
+              schema:
+                type: integer
+                minimum: 0
+                maximum: 100
+            X-Trace-Id:
+              description: Trace identifier for the rejected request
+              example: "trace-123"
