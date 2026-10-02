@@ -1,6 +1,6 @@
 //! Schema utilities for OpenAPI-specific constructs (discriminator, etc.).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
@@ -10,7 +10,9 @@ pub struct Discriminator {
     /// The property name used to distinguish between variants.
     pub property_name: String,
     /// Optional explicit mapping: discriminator value → `$ref` string (or schema name).
-    pub mapping: HashMap<String, String>,
+    ///
+    /// Ordered so discriminator-driven variant selection stays deterministic.
+    pub mapping: BTreeMap<String, String>,
 }
 
 /// Extract a [`Discriminator`] from a schema that contains a `discriminator` key.
@@ -21,7 +23,7 @@ pub fn extract_discriminator(schema: &Value) -> Option<Discriminator> {
     let disc = schema.get("discriminator")?.as_object()?;
     let property_name = disc.get("propertyName")?.as_str()?.to_owned();
 
-    let mut mapping = HashMap::new();
+    let mut mapping = BTreeMap::new();
     if let Some(map) = disc.get("mapping").and_then(Value::as_object) {
         for (key, value) in map {
             if let Some(ref_val) = value.as_str() {

@@ -1,6 +1,6 @@
 //! Deterministic JSON data generator from schema.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -46,15 +46,19 @@ fn generate_with_rng(
     // Handle oneOf / anyOf with optional discriminator support.
     if let Some(variants) =
         schema.get("oneOf").or_else(|| schema.get("anyOf")).and_then(Value::as_array) &&
-        let Some(first) = variants.first()
+        !variants.is_empty()
     {
-        let mut value = generate_with_rng(first, rng, depth + 1)?;
-        if let Some(disc) = schema::extract_discriminator(schema) &&
-            let Value::Object(ref mut obj) = value
+        let discriminator = schema::extract_discriminator(schema);
+        let index = match &discriminator {
+            Some(disc) => pick_discriminator_variant_index(variants, &disc.mapping, rng),
+            None => rng.random_range(0..variants.len()),
+        };
+        let mut value = generate_with_rng(&variants[index], rng, depth + 1)?;
+        if let Some(disc) = discriminator &&
+            let Value::Object(obj) = &mut value
         {
-            let disc_value =
-                disc.mapping.keys().next().cloned().unwrap_or_else(|| "variant_0".to_owned());
-            obj.insert(disc.property_name, Value::String(disc_value));
+            let variant_value = discriminator_value_for_index(&disc, variants, index);
+            obj.insert(disc.property_name.clone(), Value::String(variant_value));
         }
         return Ok(value);
     }
@@ -68,9 +72,10 @@ fn generate_with_rng(
     }
 
     if let Some(enum_values) = schema.get("enum").and_then(Value::as_array) &&
-        let Some(selected) = enum_values.first()
+        !enum_values.is_empty()
     {
-        return Ok(selected.clone());
+        let index = rng.random_range(0..enum_values.len());
+        return Ok(enum_values[index].clone());
     }
     if let Some(const_value) = schema.get("const") {
         return Ok(const_value.clone());
@@ -290,6 +295,74 @@ fn merge_values(target: &mut Value, source: Value) {
         }
         (target_slot, source_value) => *target_slot = source_value,
     }
+}
+
+/// Schema name recorded for a resolved `oneOf`/`anyOf` variant.
+///
+/// [`RefResolver`](crate::ref_resolver::RefResolver) inlines `$ref` nodes before
+/// generation, so a variant carries no `$ref` of its own.  OpenAPI also permits
+/// an `x-specmock-variant` hint for specs that need an explicit variant mapping.
+fn variant_schema_name(schema: &Value) -> Option<&str> {
+    schema.get("x-specmock-variant").and_then(Value::as_str)
+}
+
+/// Pick the variant index that matches the discriminator mapping.
+///
+/// `mapping` is ordered by key, while `variants` follows the `oneOf`/`anyOf`
+/// declaration order.  Selecting by mapping key keeps the generated
+/// discriminator property consistent with the generated payload; when the
+/// mapping cannot be aligned to the variant list, the first declared variant is
+/// used so behaviour stays deterministic.
+fn pick_discriminator_variant_index(
+    variants: &[Value],
+    mapping: &BTreeMap<String, String>,
+    rng: &mut ChaCha8Rng,
+) -> usize {
+    if mapping.is_empty() || variants.is_empty() {
+        return rng.random_range(0..variants.len());
+    }
+
+    let candidates: Vec<usize> = mapping
+        .values()
+        .filter_map(|ref_value| {
+            let target_name = ref_value.rsplit('/').next().unwrap_or(ref_value);
+            variants.iter().position(|variant| {
+                variant_schema_name(variant) == Some(target_name) ||
+                    variant.get("title").and_then(Value::as_str) == Some(target_name)
+            })
+        })
+        .collect();
+
+    let unique: BTreeSet<usize> = candidates.into_iter().collect();
+    match unique.len() {
+        0 => rng.random_range(0..variants.len()),
+        1 => unique.into_iter().next().unwrap_or(0),
+        _ => {
+            let mut sorted: Vec<usize> = unique.into_iter().collect();
+            sorted.sort_unstable();
+            rng.random_range(sorted[0]..=sorted[sorted.len() - 1])
+        }
+    }
+}
+
+/// Discriminator property value that corresponds to the chosen variant.
+fn discriminator_value_for_index(
+    disc: &schema::Discriminator,
+    variants: &[Value],
+    index: usize,
+) -> String {
+    if let Some(chosen) = variants.get(index) {
+        let chosen_name =
+            variant_schema_name(chosen).or_else(|| chosen.get("title").and_then(Value::as_str));
+        if let Some(chosen_name) = chosen_name &&
+            let Some((key, _target)) = disc.mapping.iter().find(|(_key, target)| {
+                target.rsplit('/').next().unwrap_or(target) == chosen_name
+            })
+        {
+            return key.clone();
+        }
+    }
+    disc.mapping.keys().next().cloned().unwrap_or_else(|| "variant_0".to_owned())
 }
 
 #[cfg(test)]
@@ -649,5 +722,166 @@ mod tests {
         });
         let result = generate_json_value(&schema, 42).unwrap();
         assert!(result.is_number());
+    }
+
+    // ── seed-driven selection ─────────────────────────────────────────
+
+    /// Generate over many seeds and collect the distinct results.
+    fn distinct_over_seeds(schema: &Value) -> Vec<Value> {
+        let mut distinct: BTreeSet<String> = BTreeSet::new();
+        for seed in 0_u64..64 {
+            let value = generate_json_value(schema, seed).expect("generation should succeed");
+            distinct.insert(value.to_string());
+        }
+        distinct.into_iter().filter_map(|text| serde_json::from_str(&text).ok()).collect()
+    }
+
+    #[test]
+    fn enum_selection_varies_with_seed() {
+        let schema = json!({"enum": ["A", "B", "C"]});
+        let distinct = distinct_over_seeds(&schema);
+        assert!(distinct.len() > 1, "enum generation must vary with the seed, got {distinct:?}");
+        assert!(
+            distinct.iter().all(|value| matches!(value.as_str(), Some("A" | "B" | "C"))),
+            "every generated enum value must be declared, got {distinct:?}"
+        );
+    }
+
+    #[test]
+    fn enum_generation_is_deterministic_for_a_seed() {
+        let schema = json!({"enum": ["A", "B", "C"]});
+        let first = generate_json_value(&schema, 7).expect("first");
+        let second = generate_json_value(&schema, 7).expect("second");
+        assert_eq!(first, second, "same seed must reproduce the same enum value");
+    }
+
+    #[test]
+    fn object_enum_property_varies_with_seed() {
+        let schema = json!({
+            "type": "object",
+            "required": ["status"],
+            "properties": {"status": {"type": "string", "enum": ["ok", "degraded", "down"]}}
+        });
+        let distinct = distinct_over_seeds(&schema);
+        assert!(distinct.len() > 1, "nested enum values must vary with the seed, got {distinct:?}");
+    }
+
+    #[test]
+    fn one_of_variant_selection_varies_with_seed() {
+        let schema = json!({
+            "oneOf": [
+                {"type": "object", "required": ["bark"], "properties": {"bark": {"type": "boolean"}}},
+                {"type": "object", "required": ["purr"], "properties": {"purr": {"type": "boolean"}}}
+            ]
+        });
+        let distinct = distinct_over_seeds(&schema);
+        assert!(
+            distinct.len() > 1,
+            "oneOf variant selection must vary with the seed, got {distinct:?}"
+        );
+        for value in &distinct {
+            let object = value.as_object().expect("object");
+            assert!(
+                object.contains_key("bark") || object.contains_key("purr"),
+                "generated value must match a declared variant, got {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn discriminator_value_matches_selected_variant() {
+        // Mapping order (`dog` first) is the reverse of `oneOf` order, so a
+        // naive "first mapping key" implementation emits a `dog` payload built
+        // from the `cat` variant.
+        let schema = json!({
+            "type": "object",
+            "discriminator": {
+                "propertyName": "petType",
+                "mapping": {"dog": "#/components/schemas/Dog", "cat": "#/components/schemas/Cat"}
+            },
+            "oneOf": [
+                {
+                    "x-specmock-variant": "Cat",
+                    "type": "object",
+                    "required": ["petType", "purr"],
+                    "properties": {"petType": {"type": "string"}, "purr": {"type": "boolean"}}
+                },
+                {
+                    "x-specmock-variant": "Dog",
+                    "type": "object",
+                    "required": ["petType", "bark"],
+                    "properties": {"petType": {"type": "string"}, "bark": {"type": "boolean"}}
+                }
+            ]
+        });
+
+        for seed in 0_u64..32 {
+            let value = generate_json_value(&schema, seed).expect("generation should succeed");
+            let object = value.as_object().expect("object");
+            let pet_type = object.get("petType").and_then(Value::as_str).expect("petType");
+            match pet_type {
+                "dog" => {
+                    assert!(object.contains_key("bark"), "seed {seed}: dog payload needs bark")
+                }
+                "cat" => {
+                    assert!(object.contains_key("purr"), "seed {seed}: cat payload needs purr")
+                }
+                other => panic!("seed {seed}: unexpected petType {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn discriminator_variant_selection_can_cover_all_variants() {
+        let schema = json!({
+            "type": "object",
+            "discriminator": {
+                "propertyName": "petType",
+                "mapping": {"dog": "#/components/schemas/Dog", "cat": "#/components/schemas/Cat"}
+            },
+            "oneOf": [
+                {
+                    "x-specmock-variant": "Dog",
+                    "type": "object",
+                    "required": ["petType", "bark"],
+                    "properties": {"petType": {"type": "string"}, "bark": {"type": "boolean"}}
+                },
+                {
+                    "x-specmock-variant": "Cat",
+                    "type": "object",
+                    "required": ["petType", "purr"],
+                    "properties": {"petType": {"type": "string"}, "purr": {"type": "boolean"}}
+                }
+            ]
+        });
+
+        let mut seen = BTreeSet::new();
+        for seed in 0_u64..64 {
+            let value = generate_json_value(&schema, seed).expect("generation should succeed");
+            if let Some(pet_type) = value.get("petType").and_then(Value::as_str) {
+                seen.insert(pet_type.to_owned());
+            }
+        }
+        assert_eq!(
+            seen,
+            BTreeSet::from(["cat".to_owned(), "dog".to_owned()]),
+            "seeded generation should reach every mapped variant"
+        );
+    }
+
+    #[test]
+    fn generated_values_always_validate_against_their_schema() {
+        let schema = json!({
+            "oneOf": [
+                {"type": "object", "required": ["bark"], "properties": {"bark": {"type": "boolean"}}},
+                {"type": "object", "required": ["purr"], "properties": {"purr": {"type": "boolean"}}}
+            ]
+        });
+        for seed in 0_u64..32 {
+            let value = generate_json_value(&schema, seed).expect("generation should succeed");
+            let issues = crate::validate::validate_instance(&schema, &value)
+                .expect("validator should compile");
+            assert!(issues.is_empty(), "seed {seed} produced invalid data: {issues:?}");
+        }
     }
 }
