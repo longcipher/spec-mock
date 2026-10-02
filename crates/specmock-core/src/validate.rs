@@ -20,11 +20,50 @@ static VALIDATOR_CACHE: LazyLock<HashMap<u64, Arc<Validator>>> = LazyLock::new(H
 static VALIDATOR_CACHE_MAX_ENTRIES: AtomicUsize =
     AtomicUsize::new(DEFAULT_VALIDATOR_CACHE_MAX_ENTRIES);
 
+/// Hash a schema into a stable cache key.
+///
+/// The value tree is hashed in place rather than serialized first: validation
+/// runs on every request, and materialising a full JSON string per call was the
+/// dominant cost of the cache lookup.  Every container is length-prefixed so
+/// structurally different schemas cannot hash to the same key by reordering
+/// members.
 fn hash_value(value: &Value) -> u64 {
     let mut hasher = DefaultHasher::new();
-    let s = serde_json::to_string(value).unwrap_or_default();
-    s.hash(&mut hasher);
+    hash_json_value(value, &mut hasher);
     hasher.finish()
+}
+
+fn hash_json_value<H: Hasher>(value: &Value, hasher: &mut H) {
+    match value {
+        Value::Null => hasher.write_u8(0),
+        Value::Bool(flag) => {
+            hasher.write_u8(1);
+            hasher.write_u8(u8::from(*flag));
+        }
+        Value::Number(number) => {
+            hasher.write_u8(2);
+            number.to_string().hash(hasher);
+        }
+        Value::String(text) => {
+            hasher.write_u8(3);
+            text.hash(hasher);
+        }
+        Value::Array(items) => {
+            hasher.write_u8(4);
+            hasher.write_usize(items.len());
+            for item in items {
+                hash_json_value(item, hasher);
+            }
+        }
+        Value::Object(members) => {
+            hasher.write_u8(5);
+            hasher.write_usize(members.len());
+            for (key, nested) in members {
+                key.hash(hasher);
+                hash_json_value(nested, hasher);
+            }
+        }
+    }
 }
 
 /// Validate an instance against a JSON schema and return all issues.
@@ -211,6 +250,105 @@ mod tests {
         assert!(
             cached_validator_count_for_tests() <= 2,
             "validator cache should trim to max entries"
+        );
+    }
+
+    #[test]
+    fn validator_cache_key_ignores_member_ordering() {
+        let _guard = CacheTestGuard::new();
+
+        let first = json!({
+            "type": "object",
+            "required": ["id", "name"],
+            "properties": {
+                "id": {"type": "integer"},
+                "name": {"type": "string"}
+            }
+        });
+        let reordered = json!({
+            "properties": {
+                "name": {"type": "string"},
+                "id": {"type": "integer"}
+            },
+            "required": ["id", "name"],
+            "type": "object"
+        });
+        let instance = json!({"id": 1, "name": "a"});
+
+        let _ = validate_instance(&first, &instance).expect("first should validate");
+        let first_address =
+            cached_validator_address_for_tests(&first).expect("first validator should be cached");
+
+        validate_instance(&reordered, &instance).expect("reordered should validate");
+        let reordered_address = cached_validator_address_for_tests(&reordered)
+            .expect("reordered schema should resolve to the cached validator");
+
+        assert_eq!(
+            reordered_address, first_address,
+            "member ordering must not change the validator cache key"
+        );
+    }
+
+    #[test]
+    fn validator_cache_key_distinguishes_structurally_different_schemas() {
+        let _guard = CacheTestGuard::new();
+
+        let base = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        // Same members, different nesting: length prefixing must keep keys apart.
+        let restructured =
+            json!({"type": "object", "properties": {"id": {"type": "integer", "minimum": 1}}});
+        let duplicate =
+            json!({"type": "object", "properties": {"id": {"type": "integer", "minimum": 1}}});
+        let instance = json!({"id": 5});
+
+        let _ = validate_instance(&base, &instance).expect("base should validate");
+        let _ = validate_instance(&restructured, &instance).expect("restructured should validate");
+        let _ = validate_instance(&duplicate, &instance).expect("duplicate should validate");
+
+        let base_address = cached_validator_address_for_tests(&base).expect("base cached");
+        let restructured_address =
+            cached_validator_address_for_tests(&restructured).expect("restructured cached");
+        let duplicate_address =
+            cached_validator_address_for_tests(&duplicate).expect("duplicate cached");
+
+        assert_ne!(
+            base_address, restructured_address,
+            "schemas with different constraints must not share a validator"
+        );
+        assert_eq!(
+            restructured_address, duplicate_address,
+            "identical schemas must share one validator"
+        );
+
+        let issues = validate_instance(&restructured, &json!({"id": 0}))
+            .expect("restructured schema should validate");
+        assert!(
+            !issues.is_empty(),
+            "the minimum constraint of the restructured schema must still be enforced"
+        );
+    }
+
+    #[test]
+    fn validator_cache_key_handles_nested_and_empty_containers() {
+        let _guard = CacheTestGuard::new();
+
+        let nested = json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {"type": "array", "items": {"type": "string"}}},
+                "meta": {"type": "object"},
+                "nothing": {"type": "null"},
+                "flag": {"type": "boolean"},
+                "score": {"type": "number", "multipleOf": 0.5}
+            }
+        });
+
+        validate_instance(&nested, &json!({"items": [["a"]], "flag": true, "score": 1.5}))
+            .expect("nested schema should compile");
+
+        assert!(
+            cached_validator_address_for_tests(&nested).is_some(),
+            "deeply nested schemas must still be cached"
         );
     }
 }
