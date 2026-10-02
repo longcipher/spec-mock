@@ -9,19 +9,20 @@
 
 ## Cargo Workspace Rules (Critical)
 
-1. Always take a dependency at the latest version released for it. Never pin an older release, never downgrade to match another manifest, and never hand-type a version number; use `cargo add` so the version is resolved from the registry.
-2. Add workspace-level dependencies with:
+1. Always take a dependency at the latest version released for it. Never pin an older release and never downgrade to match another manifest.
+2. Declare every shared external crate in root `[workspace.dependencies]` at its latest release. `cargo add` cannot write to `[workspace.dependencies]` on a virtual workspace manifest, so that version is set by hand. Discover the current release first:
 
    ```bash
-   cargo add <crate> --workspace
+   cargo add <crate> --dry-run -p <any-member>
    ```
 
-3. Add sub-crate dependencies with:
+3. Wire a declared workspace dependency into a member with `cargo add`, which generates `<crate>.workspace = true` for you:
 
    ```bash
-   cargo add <crate> -p <crate-name> --workspace
+   cargo add <crate> -p <crate-name>
    ```
 
+   Never pass an explicit `<crate>@<version>` to this command: it writes a concrete requirement straight into the member and silently bypasses the workspace entry.
 4. Root `[workspace.dependencies]` must resolve external crates from the crates.io registry; never use `git`, `path`, or other non-registry sources for them.
 5. Root `[workspace.dependencies]` must not carry features by default.
 6. Sub-crates must use `workspace = true` for `version`, `edition`, and shared dependencies.
