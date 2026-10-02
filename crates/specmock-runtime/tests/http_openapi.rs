@@ -618,6 +618,305 @@ fn openapi_content_types_spec_path() -> PathBuf {
         .join("openapi-content-types.yaml")
 }
 
+fn openapi_media_negotiation_spec_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("specs")
+        .join("openapi-media-negotiation.yaml")
+}
+
+/// Start the media-negotiation mock server, tolerating restricted sandboxes.
+async fn start_media_negotiation_server()
+-> Result<Option<specmock_runtime::RunningServer>, Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        openapi_spec: Some(openapi_media_negotiation_spec_path()),
+        mode: MockMode::Mock,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+
+    match start(config).await {
+        Ok(server) => Ok(Some(server)),
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string().into()),
+    }
+}
+
+#[tokio::test]
+async fn accept_header_selects_text_plain_response() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/report", server.http_addr))
+        .header("Accept", "text/plain")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(content_type, "text/plain", "expected negotiated text/plain content type");
+
+    let bytes = response.bytes().await?;
+    let body = String::from_utf8(bytes.to_vec())?;
+    assert_eq!(body, "Monthly Report", "text/plain body must be the raw string example");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accept_header_selects_xml_response() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/inventory", server.http_addr))
+        .header("Accept", "application/xml")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(content_type, "application/xml");
+
+    let bytes = response.bytes().await?;
+    let body = String::from_utf8(bytes.to_vec())?;
+    assert_eq!(
+        body, "<Inventory><quantity>4</quantity><sku>A-1</sku></Inventory>",
+        "xml body must use the schema xml root name and escaped elements"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn accept_header_selects_binary_response() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/avatar", server.http_addr))
+        .header("Accept", "application/octet-stream")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let bytes = response.bytes().await?;
+    assert_eq!(bytes.as_ref(), b"binary-avatar-bytes", "binary payload must not be empty");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsatisfiable_accept_returns_406() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/report", server.http_addr))
+        .header("Accept", "application/vnd.custom+report")
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status().as_u16(),
+        406,
+        "Accept header matching no declared media type must yield 406"
+    );
+
+    let bytes = response.bytes().await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body.get("status").and_then(serde_json::Value::as_u64), Some(406));
+    assert_eq!(body.get("title").and_then(serde_json::Value::as_str), Some("Not Acceptable"));
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn wildcard_accept_falls_back_to_json() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/report", server.http_addr))
+        .header("Accept", "*/*")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 200);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(content_type, "application/json");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declared_response_headers_are_emitted() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/limited", server.http_addr))
+        .header("Prefer", "code=429")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 429);
+    let remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(remaining, "7", "declared schema-constrained response header must be emitted");
+    let trace = response
+        .headers()
+        .get("x-trace-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert_eq!(trace, "trace-123", "declared example response header must be emitted");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn bodyless_response_has_no_content_type() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/empty", server.http_addr)).send().await?;
+
+    assert_eq!(response.status().as_u16(), 204);
+    let bytes = response.bytes().await?;
+    assert!(bytes.is_empty(), "204 response must have an empty body");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn declared_request_media_type_is_accepted() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::post(format!("http://{}/upload", server.http_addr))
+        .header("Content-Type", "text/plain")
+        .body("raw document text")
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "text/plain is a declared request media type and must be accepted"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn undeclared_request_media_type_returns_415() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::post(format!("http://{}/upload", server.http_addr))
+        .header("Content-Type", "application/xml")
+        .body("<doc/>")
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status().as_u16(),
+        415,
+        "media types not declared by the operation must be rejected"
+    );
+
+    let bytes = response.bytes().await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let detail = body.get("detail").and_then(serde_json::Value::as_str).unwrap_or_default();
+    assert!(
+        detail.contains("text/plain"),
+        "415 detail should list the declared media types, got: {detail}"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefer_unknown_example_returns_404_problem() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/limited", server.http_addr))
+        .header("Prefer", "example=does-not-exist")
+        .send()
+        .await?;
+
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "an unsatisfiable example preference must not silently fall back"
+    );
+
+    let bytes = response.bytes().await?;
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        body.get("type").and_then(serde_json::Value::as_str),
+        Some("about:blank"),
+        "404 must use RFC 7807 problem details"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn prefer_unknown_code_returns_404_problem() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = start_media_negotiation_server().await? else {
+        return Ok(());
+    };
+
+    let response = hpx::get(format!("http://{}/report", server.http_addr))
+        .header("Prefer", "code=418")
+        .send()
+        .await?;
+
+    assert_eq!(response.status().as_u16(), 404);
+
+    server.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn callbacks_are_fired_after_mock_response() -> Result<(), Box<dyn std::error::Error>> {
     use std::sync::Arc;

@@ -1,0 +1,110 @@
+openapi: 3.1.0
+info:
+  title: Media Negotiation API
+  version: "1.0.0"
+paths:
+  /report:
+    get:
+      operationId: getReport
+      responses:
+        "200":
+          description: ok
+          content:
+            text/plain:
+              schema:
+                type: string
+              example: "Monthly Report"
+            application/json:
+              schema:
+                type: object
+                required: [title]
+                properties:
+                  title:
+                    type: string
+              example:
+                title: "Monthly Report"
+  /inventory:
+    get:
+      operationId: getInventory
+      responses:
+        "200":
+          description: ok
+          content:
+            application/xml:
+              schema:
+                type: object
+                xml:
+                  name: Inventory
+                required: [sku]
+                properties:
+                  sku:
+                    type: string
+                  quantity:
+                    type: integer
+              example:
+                sku: "A-1"
+                quantity: 4
+  /avatar:
+    get:
+      operationId: getAvatar
+      responses:
+        "200":
+          description: ok
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+              example: "binary-avatar-bytes"
+  /limited:
+    get:
+      operationId: getRateLimited
+      responses:
+        "429":
+          description: rate limited
+          headers:
+            X-RateLimit-Remaining:
+              schema:
+                type: integer
+                minimum: 7
+                maximum: 7
+            X-Trace-Id:
+              example: "trace-123"
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                ok: true
+  /empty:
+    get:
+      operationId: getNoContent
+      responses:
+        "204":
+          description: no content
+  /upload:
+    post:
+      operationId: uploadDocument
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+          text/plain:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: ok
+          content:
+            application/json:
+              schema:
+                type: object
+              example:
+                stored: true

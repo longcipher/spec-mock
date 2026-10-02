@@ -44,10 +44,12 @@ pub struct OperationSpec {
     pub operation_id: Option<String>,
     /// Parameters.
     pub parameters: Vec<ParameterSpec>,
-    /// Request body schema.
+    /// Request body schema for the `application/json` media type.
     pub request_body_schema: Option<Value>,
     /// Whether request body is required.
     pub request_body_required: bool,
+    /// Every media type declared by the request body, in declaration order.
+    pub request_body_media_types: Vec<String>,
     /// Declared responses.
     pub responses: Vec<ResponseSpec>,
     /// OpenAPI callbacks (outbound requests fired after response).
@@ -89,17 +91,103 @@ pub struct ParameterSpec {
     pub schema: Value,
 }
 
+/// Request body model parsed from OpenAPI `requestBody`.
+#[derive(Debug, Clone)]
+struct RequestBodySpec {
+    /// JSON schema of the `application/json` media type, if declared.
+    schema: Option<Value>,
+    /// Whether the request body is required.
+    required: bool,
+    /// Every declared media type, in declaration order.
+    media_types: Vec<String>,
+}
+
 /// Response spec.
 #[derive(Debug, Clone)]
 pub struct ResponseSpec {
     /// Status selector (`200`, `default`).
     pub status: String,
-    /// JSON schema.
+    /// Declared media types, JSON-family entries first, then declaration order.
+    pub content: Vec<MediaTypeSpec>,
+    /// Declared response headers.
+    pub headers: BTreeMap<String, ResponseHeaderSpec>,
+}
+
+/// One entry of an OpenAPI response `content` map.
+#[derive(Debug, Clone)]
+pub struct MediaTypeSpec {
+    /// Media type name, e.g. `application/json`.
+    pub media_type: String,
+    /// JSON schema for this media type.
     pub schema: Option<Value>,
-    /// Explicit example payload.
+    /// Explicit example for this media type.
     pub example: Option<Value>,
     /// Named examples keyed by example name.
     pub named_examples: BTreeMap<String, Value>,
+}
+
+/// A declared response header.
+#[derive(Debug, Clone)]
+pub struct ResponseHeaderSpec {
+    /// JSON schema for the header value.
+    pub schema: Option<Value>,
+    /// Explicit example for the header value.
+    pub example: Option<Value>,
+}
+
+impl MediaTypeSpec {
+    /// Resolve the payload for this media type.
+    ///
+    /// Priority: `example` → first named example → faker over `schema`.
+    fn resolve_body(&self, seed: u64) -> Result<Option<Value>, RuntimeError> {
+        if let Some(example) = &self.example {
+            return Ok(Some(example.clone()));
+        }
+        if let Some(example) = self.named_examples.values().next() {
+            return Ok(Some(example.clone()));
+        }
+        match &self.schema {
+            Some(schema) => {
+                let value = generate_json_value(schema, seed)
+                    .map_err(|error| RuntimeError::Parse(error.to_string()))?;
+                Ok(Some(value))
+            }
+            None => Ok(None),
+        }
+    }
+}
+
+impl ResponseSpec {
+    /// Media types this response can produce, in preference order.
+    #[must_use]
+    pub fn media_types(&self) -> Vec<String> {
+        self.content.iter().map(|entry| entry.media_type.clone()).collect()
+    }
+
+    /// The preferred media type, preferring the JSON family.
+    #[must_use]
+    pub fn primary_media_type(&self) -> Option<&MediaTypeSpec> {
+        self.content.first()
+    }
+
+    /// Look up a declared media type entry.
+    #[must_use]
+    pub fn media_type_entry(&self, media_type: &str) -> Option<&MediaTypeSpec> {
+        self.content.iter().find(|entry| entry.media_type == media_type)
+    }
+
+    /// JSON schema used for payload generation and proxy validation.
+    ///
+    /// Prefers a JSON-family media type and falls back to the first declared
+    /// entry so non-JSON responses still expose their schema.
+    #[must_use]
+    pub fn json_schema(&self) -> Option<&Value> {
+        self.content
+            .iter()
+            .find(|entry| super::media::is_json_media_type(&entry.media_type))
+            .or_else(|| self.content.first())
+            .and_then(|entry| entry.schema.as_ref())
+    }
 }
 
 /// Generated response.
@@ -107,8 +195,14 @@ pub struct ResponseSpec {
 pub struct MockHttpResponse {
     /// HTTP status code.
     pub status: u16,
-    /// Optional JSON body.
+    /// Negotiated media type, absent when the response has no body.
+    pub media_type: Option<String>,
+    /// JSON schema the body was generated from, absent for bodyless responses.
+    pub schema: Option<Value>,
+    /// Mock payload, kept as JSON regardless of the wire encoding.
     pub body: Option<Value>,
+    /// Declared response headers to emit.
+    pub headers: Vec<(String, String)>,
 }
 
 impl OpenApiRuntime {
@@ -185,8 +279,9 @@ impl OpenApiRuntime {
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned),
                     parameters,
-                    request_body_schema: request_body.0,
-                    request_body_required: request_body.1,
+                    request_body_schema: request_body.schema,
+                    request_body_required: request_body.required,
+                    request_body_media_types: request_body.media_types,
                     responses,
                     callbacks,
                 });
@@ -210,12 +305,17 @@ impl OpenApiRuntime {
 
 impl OperationSpec {
     /// Validate request parts.
+    ///
+    /// `body_present` reports whether the request carried any payload at all,
+    /// which is independent of `body_json`: a non-JSON body of a declared media
+    /// type satisfies `required` without being schema-validated.
     pub fn validate_request(
         &self,
         path_params: &HashMap<String, String>,
         query_params: &HashMap<String, Vec<String>>,
         headers: &HeaderMap,
         body_json: Option<&Value>,
+        body_present: bool,
     ) -> Vec<ValidationIssue> {
         let mut issues = Vec::new();
 
@@ -335,7 +435,7 @@ impl OperationSpec {
             }
         }
 
-        if self.request_body_required && body_json.is_none() {
+        if self.request_body_required && !body_present {
             issues.push(ValidationIssue {
                 instance_pointer: "/body".to_owned(),
                 schema_pointer: "#/requestBody".to_owned(),
@@ -362,8 +462,8 @@ impl OperationSpec {
     /// Build a mocked response from OpenAPI response entries.
     ///
     /// The caller supplies [`PreferDirectives`] parsed from the request so the
-    /// engine can honour `Prefer: code=…`, `Prefer: example=…`, and
-    /// `Prefer: dynamic=true`.
+    /// engine can honour `Prefer: code=…`, `Prefer: example=…`,
+    /// `Prefer: dynamic=true`, and `Accept` content negotiation.
     pub fn mock_response(
         &self,
         seed: u64,
@@ -372,45 +472,68 @@ impl OperationSpec {
         let selected = super::negotiate::select_response(&self.responses, prefer)
             .ok_or_else(|| RuntimeError::NotFound("preferred code not found".to_owned()))?;
 
-        // Named example override.
-        if let Some(name) = &prefer.example &&
-            let Some(value) = selected.named_examples.get(name)
-        {
-            return Ok(MockHttpResponse {
-                status: parse_status_code(&selected.status),
-                body: Some(value.clone()),
-            });
-        }
+        // Content negotiation: an `Accept` header that matches nothing declared
+        // is unsatisfiable and must not silently fall back to another type.
+        // Responses without any declared content (`204`, headers-only errors)
+        // stay bodyless instead of failing negotiation.
+        let available = selected.media_types();
+        let negotiated = if available.is_empty() {
+            None
+        } else {
+            let media_type = super::negotiate::negotiate_media_type(
+                &available,
+                prefer.media_type.as_deref(),
+            )
+            .ok_or_else(|| {
+                RuntimeError::NotAcceptable(format!(
+                    "no acceptable representation for Accept header; available media types: {}",
+                    available.join(", ")
+                ))
+            })?;
 
-        // Dynamic mode: always use faker even when a static example exists.
-        if prefer.dynamic &&
-            let Some(schema) = &selected.schema
-        {
-            let value = generate_json_value(schema, seed)
-                .map_err(|error| RuntimeError::Parse(error.to_string()))?;
-            return Ok(MockHttpResponse {
-                status: parse_status_code(&selected.status),
-                body: Some(value),
-            });
-        }
+            let entry = selected.media_type_entry(&media_type).ok_or_else(|| {
+                RuntimeError::NotAcceptable(format!("media type not declared: {media_type}"))
+            })?;
 
-        if let Some(example) = &selected.example {
-            return Ok(MockHttpResponse {
-                status: parse_status_code(&selected.status),
-                body: Some(example.clone()),
-            });
-        }
+            // Named example override.  An explicitly requested example that does
+            // not exist is an error rather than a silent fallback, matching `code=`.
+            let body = if let Some(name) = &prefer.example {
+                match entry.named_examples.get(name) {
+                    Some(value) => Some(value.clone()),
+                    None => {
+                        return Err(RuntimeError::NotFound(format!(
+                            "example '{name}' not found for media type '{media_type}'"
+                        )));
+                    }
+                }
+            } else if prefer.dynamic {
+                // Dynamic mode: always use the faker even when a static example exists.
+                match &entry.schema {
+                    Some(schema) => Some(
+                        generate_json_value(schema, seed)
+                            .map_err(|error| RuntimeError::Parse(error.to_string()))?,
+                    ),
+                    None => None,
+                }
+            } else {
+                entry.resolve_body(seed)?
+            };
 
-        if let Some(schema) = &selected.schema {
-            let value = generate_json_value(schema, seed)
-                .map_err(|error| RuntimeError::Parse(error.to_string()))?;
-            return Ok(MockHttpResponse {
-                status: parse_status_code(&selected.status),
-                body: Some(value),
-            });
-        }
+            Some((media_type, entry.schema.clone(), body))
+        };
 
-        Ok(MockHttpResponse { status: parse_status_code(&selected.status), body: None })
+        let (media_type, schema, body) = match negotiated {
+            Some((media_type, schema, body)) => (Some(media_type), schema, body),
+            None => (None, None, None),
+        };
+
+        Ok(MockHttpResponse {
+            status: parse_status_code(&selected.status),
+            media_type,
+            schema,
+            headers: generate_response_headers(&selected.headers, seed),
+            body,
+        })
     }
 
     /// Retrieve response schema by concrete status code with default fallback.
@@ -420,14 +543,46 @@ impl OperationSpec {
             .responses
             .iter()
             .find(|response| response.status == status_text)
-            .and_then(|response| response.schema.as_ref())
+            .and_then(ResponseSpec::json_schema)
         {
             return Some(exact);
         }
         self.responses
             .iter()
             .find(|response| response.status == "default")
-            .and_then(|response| response.schema.as_ref())
+            .and_then(ResponseSpec::json_schema)
+    }
+}
+
+/// Render declared response headers into concrete values.
+///
+/// Each header value follows the same priority as response bodies:
+/// `example` → faker over `schema`.  Determinism is preserved by deriving a
+/// per-header seed from the response seed and header name.
+fn generate_response_headers(
+    headers: &BTreeMap<String, ResponseHeaderSpec>,
+    seed: u64,
+) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter_map(|(name, spec)| {
+            let value = match &spec.example {
+                Some(example) => Some(example.clone()),
+                None => spec.schema.as_ref().and_then(|schema| {
+                    let header_seed = crate::deterministic_hash(seed, name);
+                    generate_json_value(schema, header_seed).ok()
+                }),
+            }?;
+            Some((name.clone(), header_value_to_string(&value)))
+        })
+        .collect()
+}
+
+fn header_value_to_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
     }
 }
 
@@ -479,28 +634,52 @@ fn parse_parameters(
 fn parse_request_body(
     operation: &Map<String, Value>,
     openapi_version: &str,
-) -> Result<(Option<Value>, bool), RuntimeError> {
+) -> Result<RequestBodySpec, RuntimeError> {
+    let empty = |required| RequestBodySpec { schema: None, required, media_types: Vec::new() };
+
     let Some(request_body) = operation.get("requestBody").and_then(Value::as_object) else {
-        return Ok((None, false));
+        return Ok(empty(false));
     };
 
     let required = request_body.get("required").and_then(Value::as_bool).unwrap_or(false);
 
     let Some(content) = request_body.get("content").and_then(Value::as_object) else {
-        return Ok((None, required));
-    };
-    let Some(media_type) = content.get("application/json").and_then(Value::as_object).cloned()
-    else {
-        return Ok((None, required));
+        return Ok(empty(required));
     };
 
-    let Some(schema) = media_type.get("schema").and_then(Value::as_object) else {
-        return Ok((None, required));
-    };
+    let media_types: Vec<String> = content.keys().cloned().collect();
 
-    let mut schema_value = Value::Object(schema.clone());
-    normalize_schema(&mut schema_value, openapi_version.starts_with("3.0"));
-    Ok((Some(schema_value), required))
+    // Only `application/json` payloads are schema-validated; other media types
+    // are accepted for `Content-Type` purposes but not parsed.
+    let schema = content
+        .get("application/json")
+        .and_then(Value::as_object)
+        .and_then(|media_type| media_type.get("schema").and_then(Value::as_object))
+        .map(|schema| {
+            let mut schema_value = Value::Object(schema.clone());
+            normalize_schema(&mut schema_value, openapi_version.starts_with("3.0"));
+            schema_value
+        });
+
+    Ok(RequestBodySpec { schema, required, media_types })
+}
+
+/// Parse an OpenAPI `example` / `examples` pair into a concrete payload.
+fn parse_media_type_examples(
+    media_type: &Map<String, Value>,
+) -> (Option<Value>, BTreeMap<String, Value>) {
+    let mut named_examples = BTreeMap::new();
+    if let Some(examples_obj) = media_type.get("examples").and_then(Value::as_object) {
+        for (example_name, example_entry) in examples_obj {
+            // A named example may either be a bare value or an Example Object.
+            let value =
+                example_entry.get("value").cloned().unwrap_or_else(|| example_entry.clone());
+            named_examples.insert(example_name.clone(), value);
+        }
+    }
+    let example =
+        media_type.get("example").cloned().or_else(|| named_examples.values().next().cloned());
+    (example, named_examples)
 }
 
 fn parse_responses(
@@ -517,39 +696,68 @@ fn parse_responses(
             continue;
         };
 
-        let (schema, example, named_examples) = if let Some(content) =
-            response_object.get("content").and_then(Value::as_object) &&
-            let Some(media_type) =
-                content.get("application/json").and_then(Value::as_object).cloned()
-        {
-            let schema = media_type.get("schema").and_then(Value::as_object).map(|schema_object| {
-                let mut s = Value::Object(schema_object.clone());
-                normalize_schema(&mut s, openapi_version.starts_with("3.0"));
-                s
-            });
-            // Collect named examples map.
-            let mut named_examples = BTreeMap::new();
-            if let Some(examples_obj) = media_type.get("examples").and_then(Value::as_object) {
-                for (example_name, example_entry) in examples_obj {
-                    if let Some(val) = example_entry.get("value") {
-                        named_examples.insert(example_name.clone(), val.clone());
-                    }
-                }
+        // Parse every declared media type, not just `application/json`: specs
+        // commonly serve `text/plain`, `application/xml`, or binary payloads.
+        let mut content: Vec<MediaTypeSpec> = Vec::new();
+        if let Some(content_map) = response_object.get("content").and_then(Value::as_object) {
+            for (media_type, media_type_node) in content_map {
+                let Some(media_object) = media_type_node.as_object() else {
+                    continue;
+                };
+                let schema =
+                    media_object.get("schema").and_then(Value::as_object).map(|schema_object| {
+                        let mut s = Value::Object(schema_object.clone());
+                        normalize_schema(&mut s, openapi_version.starts_with("3.0"));
+                        s
+                    });
+                let (example, named_examples) = parse_media_type_examples(media_object);
+                content.push(MediaTypeSpec {
+                    media_type: media_type.clone(),
+                    schema,
+                    example,
+                    named_examples,
+                });
             }
+        }
 
-            let example = media_type
-                .get("example")
-                .cloned()
-                .or_else(|| named_examples.values().next().cloned());
-            (schema, example, named_examples)
-        } else {
-            (None, None, BTreeMap::new())
-        };
+        // Prefer the JSON family so `Accept`-less requests keep receiving JSON.
+        content.sort_by_key(|entry| !super::media::is_json_media_type(&entry.media_type));
 
-        responses.push(ResponseSpec { status: status.clone(), schema, example, named_examples });
+        let headers = parse_response_headers(response_object, openapi_version);
+
+        responses.push(ResponseSpec { status: status.clone(), content, headers });
     }
 
     Ok(responses)
+}
+
+fn parse_response_headers(
+    response_object: &Map<String, Value>,
+    openapi_version: &str,
+) -> BTreeMap<String, ResponseHeaderSpec> {
+    let mut headers = BTreeMap::new();
+    let Some(headers_node) = response_object.get("headers").and_then(Value::as_object) else {
+        return headers;
+    };
+
+    for (name, header_node) in headers_node {
+        let Some(header_object) = header_node.as_object() else {
+            continue;
+        };
+        let schema = header_object.get("schema").and_then(Value::as_object).map(|schema_object| {
+            let mut s = Value::Object(schema_object.clone());
+            normalize_schema(&mut s, openapi_version.starts_with("3.0"));
+            s
+        });
+        let example = header_object.get("example").cloned().or_else(|| {
+            header_object.get("examples").and_then(Value::as_object).and_then(|examples| {
+                examples.values().next().and_then(|entry| entry.get("value").cloned())
+            })
+        });
+        headers.insert(name.clone(), ResponseHeaderSpec { schema, example });
+    }
+
+    headers
 }
 
 fn parse_callbacks(
@@ -731,12 +939,17 @@ fn parse_status_code(status: &str) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use http::{HeaderMap, Method};
     use serde_json::json;
 
     use super::OpenApiRuntime;
+
+    /// Build a runtime from an inline OpenAPI document.
+    fn build_runtime(document: serde_json::Value) -> OpenApiRuntime {
+        OpenApiRuntime::from_resolved(document).expect("runtime should parse")
+    }
 
     #[test]
     fn operation_level_parameter_overrides_path_level_parameter() {
@@ -784,6 +997,7 @@ mod tests {
             &HashMap::new(),
             &HeaderMap::new(),
             None,
+            false,
         );
         assert!(alpha_issues.is_empty(), "operation-level schema should accept alpha id");
 
@@ -795,6 +1009,7 @@ mod tests {
             &HashMap::new(),
             &HeaderMap::new(),
             None,
+            false,
         );
         assert!(!numeric_issues.is_empty(), "operation-level pattern should reject numeric id");
     }
@@ -814,8 +1029,270 @@ mod tests {
         .unwrap()
         .clone();
 
-        let (schema, _required) = super::parse_request_body(&operation, "3.1.0").unwrap();
-        assert!(schema.is_none(), "non-JSON content type should not produce a schema");
+        let parsed = super::parse_request_body(&operation, "3.1.0").unwrap();
+        assert!(parsed.schema.is_none(), "non-JSON content type should not produce a JSON schema");
+        assert_eq!(parsed.media_types, vec!["application/xml".to_owned()]);
+    }
+
+    #[test]
+    fn request_body_records_every_declared_media_type() {
+        let operation = serde_json::json!({
+            "requestBody": {
+                "required": true,
+                "content": {
+                    "application/json": {"schema": {"type": "object"}},
+                    "application/xml": {"schema": {"type": "string"}}
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let parsed = super::parse_request_body(&operation, "3.1.0").unwrap();
+        assert!(parsed.required);
+        assert_eq!(
+            parsed.media_types,
+            vec!["application/json".to_owned(), "application/xml".to_owned()]
+        );
+    }
+
+    fn response_from_yaml_ish(json: serde_json::Value) -> super::ResponseSpec {
+        let operation = json.as_object().unwrap().clone();
+        let mut responses = super::parse_responses(&operation, "3.1.0").unwrap();
+        responses.remove(0)
+    }
+
+    #[test]
+    fn response_keeps_all_declared_media_types_with_json_first() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "description": "ok",
+                    "content": {
+                        "text/plain": {"schema": {"type": "string"}, "example": "hi"},
+                        "application/json": {
+                            "schema": {"type": "object"},
+                            "example": {"a": 1}
+                        }
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(
+            response.media_types(),
+            vec!["application/json".to_owned(), "text/plain".to_owned()],
+            "JSON media type must be preferred for Accept-less requests"
+        );
+        assert_eq!(
+            response.primary_media_type().map(|m| m.media_type.as_str()),
+            Some("application/json")
+        );
+    }
+
+    #[test]
+    fn response_media_type_lookup_by_name() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "description": "ok",
+                    "content": {
+                        "application/xml": {"schema": {"type": "object"}},
+                        "application/json": {"schema": {"type": "object"}}
+                    }
+                }
+            }
+        }));
+
+        let xml = response.media_type_entry("application/xml").expect("xml entry");
+        assert!(xml.schema.is_some());
+        assert!(response.media_type_entry("text/csv").is_none());
+    }
+
+    #[test]
+    fn response_headers_are_parsed() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "429": {
+                    "description": "rate limited",
+                    "headers": {
+                        "X-RateLimit-Remaining": {
+                            "schema": {"type": "integer", "minimum": 0, "maximum": 10}
+                        },
+                        "X-Trace": {"example": "abc-123"}
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(response.headers.len(), 2);
+        assert!(response.headers["X-RateLimit-Remaining"].schema.is_some());
+        assert_eq!(response.headers["X-Trace"].example, Some(serde_json::json!("abc-123")));
+    }
+
+    #[test]
+    fn mock_response_negotiates_requested_media_type() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/report": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object"},
+                                        "example": {"kind": "json"}
+                                    },
+                                    "text/plain": {
+                                        "schema": {"type": "string"},
+                                        "example": "plain-text"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime
+            .match_operation(&Method::GET, "/report")
+            .expect("operation should match")
+            .operation;
+        let prefer = super::super::negotiate::PreferDirectives {
+            media_type: Some("text/plain".to_owned()),
+            ..Default::default()
+        };
+
+        let mock = operation.mock_response(1, &prefer).expect("mock response");
+        assert_eq!(mock.media_type.as_deref(), Some("text/plain"));
+        assert_eq!(mock.body, Some(serde_json::json!("plain-text")));
+    }
+
+    #[test]
+    fn mock_response_returns_406_when_accept_is_unsatisfiable() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/report": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {"schema": {"type": "object"}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime
+            .match_operation(&Method::GET, "/report")
+            .expect("operation should match")
+            .operation;
+        let prefer = super::super::negotiate::PreferDirectives {
+            media_type: Some("application/xml".to_owned()),
+            ..Default::default()
+        };
+
+        let error = operation.mock_response(1, &prefer).expect_err("should not be acceptable");
+        assert!(
+            matches!(error, crate::RuntimeError::NotAcceptable(_)),
+            "expected NotAcceptable, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn mock_response_includes_declared_response_headers() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/limited": {
+                    "get": {
+                        "responses": {
+                            "429": {
+                                "description": "rate limited",
+                                "headers": {
+                                    "X-RateLimit-Remaining": {
+                                        "schema": {"type": "integer", "minimum": 5, "maximum": 5}
+                                    },
+                                    "X-Trace": {"example": "abc-123"}
+                                }
+                            },
+                            "200": {"description": "ok"}
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime
+            .match_operation(&Method::GET, "/limited")
+            .expect("operation should match")
+            .operation;
+        let prefer =
+            super::super::negotiate::PreferDirectives { code: Some(429), ..Default::default() };
+
+        let mock = operation.mock_response(1, &prefer).expect("mock response");
+        assert_eq!(mock.status, 429);
+        let headers: BTreeMap<&str, &str> =
+            mock.headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        assert_eq!(headers.get("X-RateLimit-Remaining"), Some(&"5"));
+        assert_eq!(headers.get("X-Trace"), Some(&"abc-123"));
+    }
+
+    #[test]
+    fn mock_response_returns_404_for_unknown_named_example() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "description": "ok",
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object"},
+                                        "examples": {
+                                            "fluffy": {"value": {"name": "Fluffy"}}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime
+            .match_operation(&Method::GET, "/pets")
+            .expect("operation should match")
+            .operation;
+
+        let missing = super::super::negotiate::PreferDirectives {
+            example: Some("nope".to_owned()),
+            ..Default::default()
+        };
+        let error = operation.mock_response(1, &missing).expect_err("example should be missing");
+        assert!(
+            matches!(error, crate::RuntimeError::NotFound(_)),
+            "expected NotFound, got {error:?}"
+        );
+
+        let present = super::super::negotiate::PreferDirectives {
+            example: Some("fluffy".to_owned()),
+            ..Default::default()
+        };
+        let mock = operation.mock_response(1, &present).expect("named example should resolve");
+        assert_eq!(mock.body, Some(serde_json::json!({"name": "Fluffy"})));
     }
 
     #[test]

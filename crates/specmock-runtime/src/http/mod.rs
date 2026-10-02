@@ -1,5 +1,6 @@
 //! HTTP and WebSocket server runtime.
 
+pub mod media;
 pub mod negotiate;
 pub mod openapi;
 pub mod proxy;
@@ -9,11 +10,11 @@ pub mod ws_handler;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use axum::{
-    Json, Router,
+    Router,
     body::{Body, to_bytes},
     extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::get,
     serve,
 };
@@ -166,15 +167,20 @@ async fn http_fallback_handler(
         return problem_response(ProblemDetails::not_found("operation not found"));
     };
 
-    // Content-Type validation: if operation declares a request body schema and the body
-    // is non-empty, require a JSON-compatible Content-Type.
-    if matched.operation.request_body_schema.is_some() &&
-        !body_bytes.is_empty() &&
-        !header_is_json(&headers)
-    {
-        return problem_response(ProblemDetails::unsupported_media_type(
-            "Content-Type must be application/json for this operation",
-        ));
+    // Content-Type validation: when the operation declares a request body, the
+    // client's media type must be among those declared.
+    if !body_bytes.is_empty() && !matched.operation.request_body_media_types.is_empty() {
+        let content_type = content_type_header(&headers).unwrap_or_default();
+        if !media::media_type_is_accepted(
+            &matched.operation.request_body_media_types,
+            &content_type,
+        ) {
+            return problem_response(ProblemDetails::unsupported_media_type(&format!(
+                "content-type '{}' is not declared for this operation; expected one of: {}",
+                content_type,
+                matched.operation.request_body_media_types.join(", ")
+            )));
+        }
     }
 
     let query_params = parse_query(uri.query());
@@ -187,8 +193,13 @@ async fn http_fallback_handler(
         Err(issue) => return error_response(StatusCode::BAD_REQUEST, vec![issue]),
     };
 
-    let validation_issues =
-        validate_http_request(&matched, &query_params, &headers, request_body_json.as_ref());
+    let validation_issues = validate_http_request(
+        &matched,
+        &query_params,
+        &headers,
+        request_body_json.as_ref(),
+        !body_bytes.is_empty(),
+    );
     if !validation_issues.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, validation_issues);
     }
@@ -210,22 +221,13 @@ async fn http_fallback_handler(
 
     let prefer = PreferDirectives::from_headers(&headers);
     let seed = crate::deterministic_hash(runtime.seed, &format!("{method}{path}"));
-    let response = match matched.operation.mock_response(seed, &prefer) {
-        Ok(mock_response) => {
-            if let Some(body) = mock_response.body {
-                json_response(
-                    StatusCode::from_u16(mock_response.status).unwrap_or(StatusCode::OK),
-                    &body,
-                )
-            } else {
-                Response::builder()
-                    .status(StatusCode::from_u16(mock_response.status).unwrap_or(StatusCode::OK))
-                    .body(Body::empty())
-                    .unwrap_or_else(|_error| Response::new(Body::empty()))
-            }
-        }
+    let mock_response = match matched.operation.mock_response(seed, &prefer) {
+        Ok(mock_response) => mock_response,
         Err(RuntimeError::NotFound(message)) => {
             return problem_response(ProblemDetails::not_found(&message));
+        }
+        Err(RuntimeError::NotAcceptable(message)) => {
+            return problem_response(ProblemDetails::not_acceptable(&message));
         }
         Err(error) => {
             return error_response(
@@ -239,6 +241,8 @@ async fn http_fallback_handler(
             );
         }
     };
+
+    let response = build_mock_response(&mock_response);
 
     // Fire callbacks asynchronously (fire-and-forget).
     if !matched.operation.callbacks.is_empty() {
@@ -269,8 +273,15 @@ fn validate_http_request(
     query_params: &HashMap<String, Vec<String>>,
     headers: &HeaderMap,
     body_json: Option<&Value>,
+    body_present: bool,
 ) -> Vec<ValidationIssue> {
-    matched.operation.validate_request(&matched.path_params, query_params, headers, body_json)
+    matched.operation.validate_request(
+        &matched.path_params,
+        query_params,
+        headers,
+        body_json,
+        body_present,
+    )
 }
 
 /// Fire an outbound callback request. Errors are logged but never propagated.
@@ -329,6 +340,68 @@ fn header_is_json(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("application/json"))
 }
 
+/// Raw `Content-Type` request header value, empty when absent.
+fn content_type_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned)
+}
+
+/// Convert a declared response header into a concrete HTTP header pair.
+///
+/// Specs may declare header names that are not valid HTTP tokens; those are
+/// skipped rather than failing the whole response.
+fn response_header(
+    name: &str,
+    value: &str,
+) -> Option<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    let header_name = axum::http::HeaderName::from_bytes(name.as_bytes()).ok()?;
+    let header_value = axum::http::HeaderValue::from_str(value).ok()?;
+    Some((header_name, header_value))
+}
+
+/// Render a mock response into an HTTP response.
+///
+/// The negotiated media type drives both the `Content-Type` header and the body
+/// encoding, so `text/plain`, `application/xml`, and binary responses carry real
+/// payloads instead of an empty body.
+fn build_mock_response(mock: &openapi::MockHttpResponse) -> Response {
+    let status = StatusCode::from_u16(mock.status).unwrap_or(StatusCode::OK);
+
+    let mut builder = Response::builder().status(status);
+    for (name, value) in &mock.headers {
+        if let Some((header_name, header_value)) = response_header(name, value) &&
+            let Some(headers) = builder.headers_mut()
+        {
+            headers.append(header_name, header_value);
+        }
+    }
+
+    let body = match (&mock.body, &mock.media_type) {
+        (Some(body), Some(media_type)) => {
+            media::encode_body(media_type, body, mock.schema.as_ref())
+        }
+        _ => Vec::new(),
+    };
+
+    if let Some(media_type) = &mock.media_type &&
+        let Some(headers) = builder.headers_mut()
+    {
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_str(media_type)
+                .unwrap_or_else(|_error| axum::http::HeaderValue::from_static("application/json")),
+        );
+    }
+
+    builder.body(Body::from(body)).unwrap_or_else(|_error| {
+        let mut fallback = Response::new(Body::empty());
+        *fallback.status_mut() = status;
+        fallback
+    })
+}
+
 fn error_response(status: StatusCode, issues: Vec<ValidationIssue>) -> Response {
     let problem = ProblemDetails::validation_error(status.as_u16(), issues);
     problem_response(problem)
@@ -342,10 +415,6 @@ fn problem_response(problem: ProblemDetails) -> Response {
         .header(axum::http::header::CONTENT_TYPE, PROBLEM_JSON_CONTENT_TYPE)
         .body(Body::from(body))
         .unwrap_or_else(|_| Response::new(Body::empty()))
-}
-
-fn json_response(status: StatusCode, body: &Value) -> Response {
-    (status, Json(body.clone())).into_response()
 }
 
 /// Replace tokens that look like absolute filesystem paths with `[redacted]`.

@@ -236,6 +236,9 @@ pub enum RuntimeError {
     /// Requested response not found.
     #[error("not found: {0}")]
     NotFound(String),
+    /// No declared response representation satisfies the request.
+    #[error("not acceptable: {0}")]
+    NotAcceptable(String),
 }
 
 /// Start protocol runtimes.
@@ -344,5 +347,39 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok(), "should allow private upstream when flag is set");
+    }
+
+    #[test]
+    fn reject_ws_path_without_leading_slash() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            ws_path: "socket".to_owned(),
+            ..Default::default()
+        };
+        let err = config.validate().expect_err("should reject a ws path without a leading slash");
+        assert!(format!("{err}").contains("'/'"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn accept_custom_ws_path_with_leading_slash() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config = ServerConfig {
+            openapi_spec: Some(spec),
+            ws_path: "/socket".to_owned(),
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok(), "a custom ws path must be accepted");
+    }
+
+    #[test]
+    fn reject_zero_max_body_size() {
+        let spec =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/specs/pets.openapi.yaml");
+        let config =
+            ServerConfig { openapi_spec: Some(spec), max_body_size: 0, ..Default::default() };
+        assert!(config.validate().is_err(), "a zero body limit must be rejected");
     }
 }

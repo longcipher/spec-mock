@@ -245,27 +245,13 @@ mod tests {
 
     // ── select_response ────────────────────────────────────────────────
 
+    /// Build a body-less response spec for the given status.
+    fn bodyless_response(status: &str) -> ResponseSpec {
+        ResponseSpec { status: status.into(), content: Vec::new(), headers: BTreeMap::new() }
+    }
+
     fn make_responses() -> Vec<ResponseSpec> {
-        vec![
-            ResponseSpec {
-                status: "200".into(),
-                schema: None,
-                example: None,
-                named_examples: BTreeMap::new(),
-            },
-            ResponseSpec {
-                status: "404".into(),
-                schema: None,
-                example: None,
-                named_examples: BTreeMap::new(),
-            },
-            ResponseSpec {
-                status: "500".into(),
-                schema: None,
-                example: None,
-                named_examples: BTreeMap::new(),
-            },
-        ]
+        vec![bodyless_response("200"), bodyless_response("404"), bodyless_response("500")]
     }
 
     #[test]
@@ -294,12 +280,7 @@ mod tests {
 
     #[test]
     fn select_response_default_fallback() {
-        let responses = vec![ResponseSpec {
-            status: "default".into(),
-            schema: None,
-            example: None,
-            named_examples: BTreeMap::new(),
-        }];
+        let responses = vec![bodyless_response("default")];
         let prefer = PreferDirectives::default();
         let selected = select_response(&responses, &prefer);
         assert_eq!(selected.map(|r| r.status.as_str()), Some("default"));

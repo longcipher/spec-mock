@@ -79,6 +79,19 @@ impl ProblemDetails {
         }
     }
 
+    /// Create a 406 Not Acceptable response.
+    #[must_use]
+    pub fn not_acceptable(detail: &str) -> Self {
+        Self {
+            problem_type: "about:blank".to_owned(),
+            title: "Not Acceptable".to_owned(),
+            status: 406,
+            detail: detail.to_owned(),
+            instance: None,
+            errors: Vec::new(),
+        }
+    }
+
     /// Create a 413 Payload Too Large response.
     #[must_use]
     pub fn payload_too_large(detail: &str) -> Self {
@@ -181,6 +194,14 @@ mod tests {
         let problem = ProblemDetails::unsupported_media_type("expected application/json");
         assert_eq!(problem.status, 415);
         assert_eq!(problem.title, "Unsupported Media Type");
+    }
+
+    #[test]
+    fn not_acceptable_has_correct_fields() {
+        let problem = ProblemDetails::not_acceptable("no acceptable representation");
+        assert_eq!(problem.status, 406);
+        assert_eq!(problem.title, "Not Acceptable");
+        assert_eq!(problem.detail, "no acceptable representation");
     }
 
     #[test]

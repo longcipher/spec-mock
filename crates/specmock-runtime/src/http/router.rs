@@ -207,6 +207,7 @@ mod tests {
             parameters: vec![],
             request_body_schema: None,
             request_body_required: false,
+            request_body_media_types: Vec::new(),
             responses: vec![],
             callbacks: vec![],
         }
