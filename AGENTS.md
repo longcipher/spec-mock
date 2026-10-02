@@ -9,7 +9,7 @@
 
 ## Cargo Workspace Rules (Critical)
 
-1. Never manually type dependency versions in `Cargo.toml`; use `cargo add`.
+1. Always take a dependency at the latest version released for it. Never pin an older release, never downgrade to match another manifest, and never hand-type a version number; use `cargo add` so the version is resolved from the registry.
 2. Add workspace-level dependencies with:
 
    ```bash
@@ -22,23 +22,22 @@
    cargo add <crate> -p <crate-name> --workspace
    ```
 
-4. Root `[workspace.dependencies]` must use numeric versions only.
+4. Root `[workspace.dependencies]` must resolve external crates from the crates.io registry; never use `git`, `path`, or other non-registry sources for them.
 5. Root `[workspace.dependencies]` must not carry features by default.
 6. Sub-crates must use `workspace = true` for `version`, `edition`, and shared dependencies.
+7. Before declaring a dependency change done, re-check every entry against the newest published release and confirm that `cargo build`, `just lint`, and `just test` all pass with no warnings and no errors.
 
-## Preferred Dependencies and Versions
+## Dependency Version Policy
 
-When introducing new dependencies, prefer these versions unless compatibility requires an upgrade:
+- Use the latest released version of every crate. Upgrading is the default, not an exception that needs justification.
+- Never record version numbers in this file. Version lists here go stale and silently become wrong; resolve versions from the registry at the moment of the change instead.
+- Never hold a dependency back for unrelated reasons. When a newer major or minor release lands, upgrade it in the same change and fix any fallout.
+- Keep the manifest honest: if the workspace was last synchronized long after a release, refresh the whole dependency set rather than only the crate being touched.
+- Prefer checking the actual latest release over inferring it. Useful ways to confirm:
 
-- `clap = "4.6.1"`
-- `eyre = "0.6.12"`
-- `hpx = "2.4.24"`
-- `scc = "3.8.3"`
-- `serde = "1.0.228"`
-- `thiserror = "2.0.18"`
-- `tokio = "1.52.3"`
-- `tracing = "0.1.44"`
-- `tracing-subscriber = "0.3.23"`
+  ```bash
+  cargo search <crate> --limit 1
+  ```
 
 ## Dependency Priority and Forbidden Choices
 
