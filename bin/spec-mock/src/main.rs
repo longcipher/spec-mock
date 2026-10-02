@@ -49,6 +49,9 @@ struct ServeArgs {
     /// gRPC bind address.
     #[arg(long, default_value = "127.0.0.1:5010")]
     grpc_addr: SocketAddr,
+    /// WebSocket path served by the AsyncAPI runtime.
+    #[arg(long, default_value = "/ws")]
+    ws_path: String,
     /// Maximum request body size in bytes.
     #[arg(long, default_value_t = 10_485_760)]
     max_body_size: usize,
@@ -91,6 +94,7 @@ async fn serve_command(args: ServeArgs) -> Result<(), eyre::Report> {
         .mode(args.mode.into_runtime_mode())
         .http_addr(args.http_addr)
         .grpc_addr(args.grpc_addr)
+        .ws_path(args.ws_path)
         .max_body_size(args.max_body_size)
         .allow_private_upstream(args.allow_private_upstream);
 

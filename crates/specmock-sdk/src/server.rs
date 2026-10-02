@@ -172,6 +172,13 @@ impl MockServerBuilder {
         self
     }
 
+    /// Set the WebSocket path served by the AsyncAPI runtime.
+    #[must_use]
+    pub fn ws_path(mut self, path: impl Into<String>) -> Self {
+        self.config.ws_path = path.into();
+        self
+    }
+
     /// Set maximum request body size in bytes.
     #[must_use]
     pub const fn max_body_size(mut self, size: usize) -> Self {
@@ -212,6 +219,8 @@ impl MockServerBuilder {
             .arg(self.config.grpc_addr.to_string())
             .arg("--seed")
             .arg(self.config.seed.to_string())
+            .arg("--ws-path")
+            .arg(self.config.ws_path.as_str())
             .arg("--mode")
             .arg(match self.config.mode {
                 MockMode::Mock => "mock",

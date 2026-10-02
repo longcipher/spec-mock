@@ -268,3 +268,57 @@ async fn ws_per_channel_path_unknown_channel_returns_not_found()
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn ws_custom_path_serves_and_per_channel_routes_follow_it()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        asyncapi_spec: Some(asyncapi_spec_path()),
+        mode: MockMode::Mock,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ws_path: "/socket".to_owned(),
+        ..ServerConfig::default()
+    };
+
+    let server = match start(config).await {
+        Ok(value) => value,
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string().into()),
+    };
+
+    // The default path must no longer be served.
+    assert!(
+        connect_async(format!("ws://{}/ws", server.http_addr)).await.is_err(),
+        "the default /ws path must not be served when a custom path is configured"
+    );
+
+    let (mut socket, _response) =
+        connect_async(format!("ws://{}/socket", server.http_addr)).await?;
+    socket
+        .send(Message::Text(
+            r#"{"channel":"chat.send","payload":{"room":"general","text":"hi"}}"#.to_owned().into(),
+        ))
+        .await?;
+
+    let next_message = socket.next().await.ok_or("expected websocket response")??;
+    let body: serde_json::Value = serde_json::from_str(next_message.to_text()?)?;
+    assert_eq!(body.get("type").and_then(serde_json::Value::as_str), Some("mock"));
+
+    // Per-channel routes are derived from the configured base path.
+    let (mut pinned, _response) =
+        connect_async(format!("ws://{}/socket/chat.send", server.http_addr)).await?;
+    pinned.send(Message::Text(r#"{"room":"general","text":"hi"}"#.to_owned().into())).await?;
+
+    let next_message = pinned.next().await.ok_or("expected websocket response")??;
+    let body: serde_json::Value = serde_json::from_str(next_message.to_text()?)?;
+    assert_eq!(
+        body.get("channel").and_then(serde_json::Value::as_str),
+        Some("chat.send"),
+        "per-channel path must pin the channel under a custom base path"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
