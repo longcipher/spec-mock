@@ -148,7 +148,10 @@ async fn resetting_clears_the_store_as_well_as_the_state() -> Result<(), Box<dyn
         .header("Prefer", "scenario=fragile")
         .send()
         .await?;
-    assert_eq!(server.scenario_state("").map(|(_, state)| state), Some("failing".to_owned()));
+    assert_eq!(
+        server.scenario_state_for("fragile", "").map(|(_, state)| state),
+        Some("failing".to_owned())
+    );
 
     server.reset_scenarios();
 
@@ -184,6 +187,7 @@ async fn a_server_without_a_sidecar_reports_no_scenarios() -> Result<(), Box<dyn
 
     assert_eq!(server.reset_scenarios(), None);
     assert_eq!(server.scenario_state(""), None);
+    assert_eq!(server.scenario_state_for("anything", ""), None);
     assert_eq!(server.control_token(), None);
 
     server.shutdown().await;

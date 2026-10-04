@@ -42,6 +42,9 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 | Content-Type validation (415)        |     ✅     |   ❌   |
 | Content negotiation (406)            |     ✅     |   ❌   |
 | Configurable WebSocket path          |     ✅     |   ❌   |
+| Stateful mocking (scenarios, store)  |     ✅     |   ❌   |
+| Create-then-read-back resource CRUD  |     ✅     |   ❌   |
+| Scenario failure injection           |     ✅     |   ❌   |
 
 ## Capability Summary
 
@@ -66,6 +69,9 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 - Content-Type validation returns 415 for media types the operation does not declare.
 - gRPC error metadata includes `grpc-status-details-bin` plus `grpc-message` and `grpc-status`.
 - AsyncAPI v2 and v3 with multi-path WebSocket routing on a configurable base path.
+- Stateful mocking via a scenario sidecar: named flows, resource CRUD backed by a
+  store, pre-seeding, per-session isolation, and error injection as a state
+  transition. See [Stateful Mocking](#stateful-mocking).
 
 ## Quick Start (CLI)
 
@@ -258,7 +264,219 @@ Options:
   --ws-path <PATH>        WebSocket base path [default: /ws]
   --max-body-size <BYTES> Maximum request body size in bytes [default: 10485760]
   --allow-private-upstream  Allow private/loopback/link-local proxy upstreams
+  --scenarios <PATH>      Scenario sidecar declaring stateful behaviour
+  --max-sessions <N>      Cap on live scenario instances [default: 256]
+  --max-store-entries <N> Cap on stored resources per instance [default: 1024]
+  --log-level <LEVEL>     Log verbosity [default: info]
+                           [possible values: error, warn, info, debug, trace]
+  --no-control-endpoints  Disable the control endpoints under /_specmock/
 ```
+
+## Stateful Mocking
+
+By default every request is independent: the mock answers from the schema, and
+nothing is remembered. A **scenario sidecar** changes that. It declares named
+flows whose responses depend on what already happened, plus a store so a client
+can create a resource and read that same resource back.
+
+Behaviour lives in a sidecar resolved *beside* the OpenAPI document, not in
+`x-specmock-*` extensions inside it. Requiring extensions would mean forking the
+input spec, and forking breaks every `$ref` into shared schema files — after
+which the mock is no longer exercising the real contract. See
+[ADR 0002](docs/adr/0002-behaviour-in-sidecar-file-not-spec-extensions.md).
+
+```bash
+cargo run -p spec-mock -- serve \
+  --openapi docs/specs/store.openapi.yaml \
+  --scenarios docs/specs/store.scenarios.yaml \
+  --log-level info
+```
+
+```yaml
+# docs/specs/store.scenarios.yaml
+version: 1
+
+operations:
+  createWidget:
+    match: { method: POST, path: /widgets }
+    store:
+      resource: /widgets
+      action: create
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "201": {}
+
+  getWidget:
+    match: { method: GET, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: read, key: "{id}" }
+    responses:
+      "200": {}
+
+  listWidgets:
+    match: { method: GET, path: /widgets }
+    store: { resource: /widgets, action: list }
+    responses:
+      "200": {}
+
+scenarios:
+  - name: catalogue
+    initialState: browsing
+    seed:
+      - resource: /widgets
+        items:
+          - { id: seeded-1, name: Preloaded Widget }
+    states:
+      browsing:
+        createWidget: { to: browsing }
+        getWidget: {}
+        listWidgets: {}
+```
+
+Create a resource, then read back exactly what was created:
+
+```bash
+curl -sX POST localhost:4010/widgets \
+  -H 'Content-Type: application/json' \
+  -d '{"id":"w1","name":"First"}'
+
+curl -s localhost:4010/widgets/w1     # => {"id":"w1","name":"First"}
+curl -s localhost:4010/widgets        # => [{"id":"seeded-1",...},{"id":"w1",...}]
+```
+
+> **Quote a path containing `{...}`.** In YAML flow style an unquoted
+> `{id}` starts a nested mapping rather than a string. Use block style or quotes.
+
+### Selecting a scenario and session
+
+| Header | Effect |
+| --- | --- |
+| `Prefer: scenario=<name>` | Run that scenario. Absent, the first declared one. |
+| `Prefer: session=<key>` | Address an isolated instance. Absent, one default instance. |
+
+Session keying is opt-in over a singleton default: embedded mode already gives
+each test its own server, while process mode shares one child across the whole
+session. Tests that run in parallel ask for their own key.
+
+### Store semantics
+
+| Action | Behaviour when the resource is absent |
+| --- | --- |
+| `create` | Stored. A colliding identifier is `409`. |
+| `read` | `404` |
+| `update` (`PUT`/`PATCH`) | `404`. Not an upsert. |
+| `delete` | `404`, and later reads also `404` |
+| `list` | `[]`, in creation order |
+
+Update is deliberately not an upsert. RFC 9110 permits create-on-`PUT`, but for a
+mock the `404` is the product: a test that updates something it never created has
+a bug, and upserting would let it pass green.
+
+Keys are `(collection path template with parameters bound, identifier)`, so
+`/users/5/orders` and `/orders` never collide on a shared `id`.
+
+Query parameters are **not** applied to `list` — no filtering, no pagination. A
+partially-honoured list is worse than a documented simple one.
+
+### Fault injection
+
+An error is a transition into a state that declares one, not a separate mechanism:
+
+```yaml
+    states:
+      healthy:
+        getWidget: { to: failing, responses: { "503": { body: { error: unavailable } } } }
+      failing:
+        getWidget: {}
+```
+
+`Prefer: code=` still works and short-circuits the machine entirely — see
+[ADR 0001](docs/adr/0001-fold-fault-injection-into-scenario-model.md). So does
+`Prefer: dynamic=true`, which bypasses the store. Both are read-only escape
+hatches and neither advances state, so neither changes meaning depending on
+whether a scenario is active.
+
+### Errors
+
+Stateful failures are RFC 7807 with structured extension members, not
+validation issues. An operation the state machine refuses has no instance and no
+schema pointer, so forcing it into a `ValidationIssue` would mean writing
+pointers that point at nothing.
+
+| Condition | Status |
+| --- | --- |
+| Unknown scenario name | `404`, `detail` lists the scenarios that exist |
+| Operation not legal in the current state | `409` |
+| Unknown resource | `404` |
+| Create identifier already taken | `409` |
+| Live session cap exceeded | `429`, `detail` names `--max-sessions` |
+| Store entry cap exceeded | `500`, `detail` names `--max-store-entries` |
+
+```json
+{
+  "type": "about:blank",
+  "title": "Conflict",
+  "status": 409,
+  "detail": "operation 'getWidget' is not legal in state 'spent' of scenario 'once' (session '__default__')",
+  "scenario": "once",
+  "session": "__default__",
+  "state": "spent",
+  "operation": "getWidget"
+}
+```
+
+### Determinism
+
+With a sidecar the guarantee becomes **same seed + same request *sequence*
+produces the same response sequence**. A store is irreducibly order-dependent:
+delete-then-read-must-`404` requires remembering that a deletion happened. See
+[ADR 0003](docs/adr/0003-determinism-is-sequence-based.md). State does not
+survive a restart.
+
+An invalid request changes nothing — not the state, not the store. The client is
+the thing under test, so a client bug must not poison every later assertion. A
+store `404` is different: it is a legitimate outcome of a *valid* request, so it
+does advance.
+
+### Control endpoints
+
+Process mode has no handle into a running child, so state is reachable over HTTP
+under the reserved `/_specmock/` prefix. It is the only mutating surface on the
+server, so it is enabled only with `--scenarios` or `.control_endpoints()` and
+every request must present the token printed at startup.
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" localhost:4010/_specmock/state
+curl -X POST -H "Authorization: Bearer $TOKEN" localhost:4010/_specmock/reset
+```
+
+Embedded mode uses the handle instead:
+
+```rust
+let server = MockServer::builder()
+    .openapi("docs/specs/store.openapi.yaml")
+    .scenarios("docs/specs/store.scenarios.yaml")
+    .start()
+    .await?;
+
+server.reset_scenarios();               // state and store, together
+let (scenario, state) = server.scenario_state("").unwrap();
+```
+
+### Not supported
+
+- Scenarios in proxy mode. The upstream holds the real state; startup rejects the
+  combination and names both settings.
+- WebSocket and gRPC scenarios. The core types are protocol-agnostic, but only
+  HTTP is wired up.
+- Filtering or pagination on `list`.
+- State surviving a restart.
+- Session expiry. A TTL would reintroduce wall-clock dependence into a tool whose
+  pitch is reproducibility.
+- Atomic read-modify-write. Two concurrent `PUT`s to one resource may interleave.
+
+Absent a sidecar, every one of the 839 tests behaves exactly as it did before
+scenarios existed. That regression guard is enforced by
+`an_absent_sidecar_leaves_plain_mocking_untouched`.
 
 ## Rust SDK
 

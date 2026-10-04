@@ -697,3 +697,94 @@ async fn control_endpoints_are_absent_unless_a_token_is_configured()
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn naming_a_different_scenario_does_not_adopt_the_first_ones_instance()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A session belongs to the flow it was created for. Before sessions were
+    // keyed by `(scenario, session)`, asking for `fragile` after `catalogue` had
+    // run reused the catalogue instance and answered with its state.
+    let Some(server) = boot(store_config()).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    // Touch the default scenario first, so a default instance exists.
+    read(hpx::Client::new().get(format!("{base}/widgets/seeded-1")).send().await?).await?;
+
+    let (status, _, body) = read(
+        hpx::Client::new()
+            .get(format!("{base}/gadgets/fragile-1"))
+            .header("Prefer", "scenario=fragile")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert_eq!(
+        status, 503,
+        "the fragile scenario declares a 503 in `healthy`, not a 409 borrowed from `catalogue`: {body}"
+    );
+    assert!(body.get("state").is_none(), "a served response carries no error extensions");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_control_state_endpoint_lists_every_live_instance()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig { control_token: Some("t".to_owned()), ..store_config() };
+    let Some(server) = boot(config).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    read(
+        hpx::Client::new()
+            .get(format!("{base}/widgets/seeded-1"))
+            .header("Prefer", "session=alpha")
+            .send()
+            .await?,
+    )
+    .await?;
+    read(
+        hpx::Client::new()
+            .get(format!("{base}/gadgets/fragile-1"))
+            .header("Prefer", "scenario=fragile, session=beta")
+            .send()
+            .await?,
+    )
+    .await?;
+
+    let (_, _, body) = read(
+        hpx::Client::new()
+            .get(format!("{base}/_specmock/state"))
+            .header("Authorization", "Bearer t")
+            .send()
+            .await?,
+    )
+    .await?;
+
+    let reported: Vec<(String, String)> = body["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .map(|entry| {
+            (
+                entry["scenario"].as_str().unwrap_or_default().to_owned(),
+                entry["state"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        reported.contains(&("catalogue".to_owned(), "browsing".to_owned())),
+        "expected the catalogue instance in {reported:?}"
+    );
+    assert!(
+        reported.contains(&("fragile".to_owned(), "failing".to_owned())),
+        "expected the fragile instance in {reported:?}"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}

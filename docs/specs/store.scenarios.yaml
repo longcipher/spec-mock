@@ -1,0 +1,86 @@
+# Scenario sidecar for `store.openapi.yaml`.
+#
+# Behaviour lives beside the spec rather than inside it, so this file can mock a
+# document you do not own. See docs/adr/0002-behaviour-in-sidecar-file-not-spec-extensions.md
+#
+# Note: in YAML flow style an unquoted `{id}` starts a nested mapping rather than
+# a string, so paths containing braces are quoted below.
+
+version: 1
+
+operations:
+  createWidget:
+    match: { method: POST, path: /widgets }
+    store:
+      resource: /widgets
+      action: create
+      # The client supplies the identifier, so the mock stores what it was given
+      # rather than a freshly generated object.
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "201": {}
+
+  getWidget:
+    match: { method: GET, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: read, key: "{id}" }
+    responses:
+      "200": {}
+
+  updateWidget:
+    match: { method: PUT, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: update, key: "{id}" }
+    responses:
+      "200": {}
+
+  deleteWidget:
+    match: { method: DELETE, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: delete, key: "{id}" }
+    responses:
+      "204": {}
+
+  listWidgets:
+    match: { method: GET, path: /widgets }
+    store: { resource: /widgets, action: list }
+    responses:
+      "200": {}
+
+  getGadget:
+    match: { method: GET, path: "/gadgets/{id}" }
+    store: { resource: /gadgets, action: read, key: "{id}" }
+    responses:
+      "200": {}
+
+scenarios:
+  # The default scenario, used when a request names none.
+  - name: catalogue
+    initialState: browsing
+    # "An authenticated user hits a protected endpoint" is the canonical test for
+    # a protected endpoint; without pre-seeding it is forced through a login flow
+    # it is not testing.
+    seed:
+      - resource: /widgets
+        items:
+          - { id: seeded-1, name: Preloaded Widget }
+    states:
+      browsing:
+        # An explicit self-loop, because an omitted target means "stay put" and
+        # firing twice should be a stated fact.
+        createWidget: { to: browsing }
+        getWidget: {}
+        updateWidget: {}
+        deleteWidget: {}
+        listWidgets: {}
+
+  # An error is a transition into a state that declares one, not a separate
+  # mechanism. See docs/adr/0001-fold-fault-injection-into-scenario-model.md
+  - name: fragile
+    initialState: healthy
+    seed:
+      - resource: /gadgets
+        items:
+          - { id: fragile-1, name: Fragile Gadget }
+    states:
+      healthy:
+        getGadget: { to: failing, responses: { "503": { body: { error: unavailable } } } }
+      failing:
+        getGadget: {}

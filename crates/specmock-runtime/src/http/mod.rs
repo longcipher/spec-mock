@@ -270,24 +270,20 @@ async fn control_state_handler(
         return problem_response(ProblemDetails::not_found("no scenario sidecar is loaded"));
     };
 
-    let mut sessions = Vec::new();
-    let mut push = |session: &str| {
-        if let Some((scenario, state)) = scenarios.session_state(session) {
-            sessions.push(serde_json::json!({
-                "session": session,
-                "scenario": scenario,
-                "state": state,
-            }));
-        }
-    };
-    push(scenarios::DEFAULT_SESSION);
-    // Named sessions are not enumerable through `scc`, so only the default is
-    // reported unless the caller asks about a specific key via `?session=`.
-    sessions.shrink_to_fit();
+    let sessions: Vec<Value> = scenarios
+        .sessions()
+        .into_iter()
+        .filter_map(|(scenario, session)| {
+            scenarios.session_state_for(&scenario, &session).map(|(_, state)| {
+                serde_json::json!({ "scenario": scenario, "session": session, "state": state })
+            })
+        })
+        .collect();
 
     axum::Json(serde_json::json!({
         "sessions": sessions,
         "count": scenarios.session_count(),
+        "scenarios": scenarios.scenario_names(),
     }))
     .into_response()
 }

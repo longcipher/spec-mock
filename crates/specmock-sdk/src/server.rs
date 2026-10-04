@@ -72,11 +72,20 @@ impl MockServer {
         self.running.scenarios().map(specmock_runtime::http::scenarios::ScenarioRuntime::reset_all)
     }
 
-    /// Current scenario and state for a session.
+    /// Current scenario and state for a session of the default scenario.
     ///
-    /// Pass an empty string for the default instance.
+    /// Pass an empty string for the default instance. Use
+    /// [`MockServer::scenario_state_for`] to address another scenario.
     pub fn scenario_state(&self, session: &str) -> Option<(String, String)> {
         self.running.scenarios()?.session_state(session)
+    }
+
+    /// Current scenario and state for one instance.
+    ///
+    /// An instance belongs to the scenario it was created for, so addressing a
+    /// different one needs both.
+    pub fn scenario_state_for(&self, scenario: &str, session: &str) -> Option<(String, String)> {
+        self.running.scenarios()?.session_state_for(scenario, session)
     }
 
     /// Bearer token guarding the control endpoints, if they are enabled.

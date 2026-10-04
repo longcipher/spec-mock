@@ -268,7 +268,13 @@ pub struct ScenarioRuntime {
     sidecar: ValidatedSidecar,
     /// Catalogue keyed by request signature so lookup is a direct hit.
     by_request: HashMap<String, ResolvedOperation>,
-    sessions: ConcurrentMap<String, Arc<Instance>>,
+    /// Live instances, keyed by `(scenario, session)`.
+    ///
+    /// The scenario is part of the key because an instance belongs to the flow
+    /// it was created for. Keying by session alone would let a request naming a
+    /// different scenario silently adopt the first one's state and store, which
+    /// then reports a state from an unrelated flow.
+    sessions: ConcurrentMap<(String, String), Arc<Instance>>,
     max_sessions: usize,
     max_store_entries: usize,
 }
@@ -351,14 +357,37 @@ impl ScenarioRuntime {
         count
     }
 
-    /// Current scenario and state for a session, for the control endpoint.
+    /// Current scenario and state for a session of the default scenario.
+    ///
+    /// Pass an empty string for the default instance.
     #[must_use]
     pub fn session_state(&self, session: &str) -> Option<(String, String)> {
-        let key = if session.is_empty() { DEFAULT_SESSION } else { session };
-        let instance = self.sessions.get_sync(&key.to_owned())?;
-        let scenario = instance.scenario.clone();
+        let scenario = self.default_scenario_name()?.to_owned();
+        self.session_state_for(&scenario, session)
+    }
+
+    /// Current scenario and state for one instance.
+    #[must_use]
+    pub fn session_state_for(&self, scenario: &str, session: &str) -> Option<(String, String)> {
+        let key = (
+            scenario.to_owned(),
+            if session.is_empty() { DEFAULT_SESSION.to_owned() } else { session.to_owned() },
+        );
+        let instance = self.sessions.get_sync(&key)?;
         let state = instance.current();
-        Some((scenario, state.name().to_owned()))
+        Some((instance.scenario.clone(), state.name().to_owned()))
+    }
+
+    /// Live `(scenario, session)` pairs, for the control endpoint.
+    #[must_use]
+    pub fn sessions(&self) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        self.sessions.iter_sync(|(scenario, session), _| {
+            found.push((scenario.clone(), session.clone()));
+            true
+        });
+        found.sort();
+        found
     }
 
     fn machine(&self, name: &str) -> Option<Scenario> {
@@ -519,7 +548,8 @@ impl ScenarioRuntime {
         machine: &Scenario,
         session: &str,
     ) -> Result<Arc<Instance>, StatefulFailure> {
-        if let Some(existing) = self.sessions.get_sync(&session.to_owned()) {
+        let key = (machine.name().to_owned(), session.to_owned());
+        if let Some(existing) = self.sessions.get_sync(&key) {
             return Ok(Arc::clone(&existing));
         }
         if self.sessions.len() >= self.max_sessions {
@@ -541,10 +571,10 @@ impl ScenarioRuntime {
 
         // A concurrent request may have won the race. Adopt its instance rather
         // than replacing it, so both callers share one run.
-        if let Some(existing) = self.sessions.get_sync(&session.to_owned()) {
+        if let Some(existing) = self.sessions.get_sync(&key) {
             return Ok(Arc::clone(&existing));
         }
-        match self.sessions.insert_sync(session.to_owned(), Arc::clone(&fresh)) {
+        match self.sessions.insert_sync(key, Arc::clone(&fresh)) {
             Ok(()) => Ok(fresh),
             Err((_, existing)) => Ok(existing),
         }
