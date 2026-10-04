@@ -11,7 +11,12 @@ categories.workspace = true
 description = "Core types, schema validation, and deterministic data generation for spec-mock"
 
 [dependencies]
-jsonschema = { workspace = true }
+# Default features are disabled deliberately: they enable `reqwest`,
+# `resolve-http` and `tls-aws-lc-rs`, which drag in `rustls` and the
+# `aws-lc-sys` C build. This crate only ever calls `validator_for` on a
+# self-contained schema — `$ref` resolution is done by our own
+# `ref_resolver` — so the network/file resolvers are never reachable.
+jsonschema = { workspace = true, default-features = false }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 rand_regex = { workspace = true }
@@ -27,5 +32,6 @@ tracing = { workspace = true }
 expect_used = "allow"
 
 [dev-dependencies]
+proptest = { workspace = true }
 regex-lite = { workspace = true }
 tempfile = { workspace = true }

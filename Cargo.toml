@@ -9,7 +9,12 @@ categories = ["development-tools::testing", "web-programming", "simulation"]
 
 [workspace]
 members = ["bin/*", "crates/*"]
-exclude = [".github/"]
+# Fuzz targets are detached workspaces built by `cargo fuzz`, not workspace members.
+exclude = [
+    ".github/",
+    "crates/specmock-core/fuzz",
+    "crates/specmock-runtime/fuzz",
+]
 resolver = "3"
 
 [workspace.dependencies]
@@ -32,6 +37,7 @@ http-body-util = "0.1.5"
 hyper = "1.11.1"
 hyper-util = "0.1.21"
 jsonschema = "0.58.4"
+proptest = "1.11.0"
 prost = "0.14.4"
 prost-reflect = "0.16.5"
 protox = "0.9.1"

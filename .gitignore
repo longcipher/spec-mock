@@ -2,6 +2,10 @@
 /target/
 Cargo.lock
 
+# Coverage
+*.profraw
+lcov.info
+
 # IDE
 .idea/
 .vscode/
