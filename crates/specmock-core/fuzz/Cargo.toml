@@ -1,0 +1,47 @@
+[package]
+name = "specmock-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# A fuzz crate is a detached workspace, so it cannot inherit from the root
+# `[workspace.dependencies]` and declares its dependencies directly.
+libfuzzer-sys = "0.4.13"
+serde_json = "1.0.151"
+specmock-core = { path = ".." }
+
+[[bin]]
+name = "ref_resolver"
+path = "fuzz_targets/ref_resolver.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_pointer"
+path = "fuzz_targets/json_pointer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "faker"
+path = "fuzz_targets/faker.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "validate"
+path = "fuzz_targets/validate.rs"
+test = false
+doc = false
+bench = false
+
+# Detached from the parent workspace: cargo-fuzz builds these targets with its
+# own sanitizer/panic-abort profile.
+[workspace]

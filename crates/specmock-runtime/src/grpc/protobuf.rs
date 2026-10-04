@@ -609,10 +609,12 @@ fn scalar_value_for_field(kind: &Kind, seed: u64, depth: usize) -> Result<Value,
 #[cfg(test)]
 mod tests {
     use base64::Engine;
+    use bytes::Bytes;
+    use http_body_util::BodyExt as _;
     use prost::Message;
     use serde_json::json;
 
-    use super::{GoogleRpcBadRequest, GoogleRpcStatus, build_grpc_status_details_bin};
+    use super::{GoogleRpcBadRequest, GoogleRpcStatus, GrpcRuntime, build_grpc_status_details_bin};
 
     #[test]
     fn grpc_status_details_bin_encodes_status_and_details() {
@@ -656,5 +658,393 @@ mod tests {
         assert_eq!(bad_request.field_violations.len(), 1);
         assert_eq!(bad_request.field_violations[0].field, "payload.id");
         assert!(bad_request.field_violations[0].description.contains("invalid type"));
+    }
+
+    // ── gRPC framing ───────────────────────────────────────────────────
+
+    #[test]
+    fn framing_round_trips() {
+        for payload in
+            [Vec::new(), vec![0_u8], vec![1, 2, 3, 4, 5], (0_u8..=255).collect::<Vec<u8>>()]
+        {
+            let framed = super::encode_grpc_unary_frame(&payload);
+            assert_eq!(framed.len(), payload.len() + 5, "a gRPC frame carries a 5-byte prefix");
+            assert_eq!(framed[0], 0, "the compression flag must be 0");
+            assert_eq!(
+                u32::from_be_bytes([framed[1], framed[2], framed[3], framed[4]]) as usize,
+                payload.len()
+            );
+            assert_eq!(super::decode_grpc_unary_frame(&framed).expect("decode"), payload);
+        }
+    }
+
+    #[test]
+    fn frames_shorter_than_the_prefix_are_rejected() {
+        for length in 0..5_usize {
+            let error = super::decode_grpc_unary_frame(&vec![0_u8; length])
+                .expect_err("a truncated prefix must be rejected");
+            assert_eq!(error, "grpc frame too short", "length {length}");
+        }
+    }
+
+    #[test]
+    fn compressed_frames_are_rejected() {
+        let mut framed = super::encode_grpc_unary_frame(b"payload");
+        framed[0] = 1;
+        let error =
+            super::decode_grpc_unary_frame(&framed).expect_err("compression flag must be checked");
+        assert_eq!(error, "compressed grpc payload is not supported");
+    }
+
+    #[test]
+    fn frames_with_an_inconsistent_length_are_rejected() {
+        // Declare 100 bytes but supply fewer.
+        let mut framed = super::encode_grpc_unary_frame(b"short");
+        framed[1..5].copy_from_slice(&100_u32.to_be_bytes());
+        let error =
+            super::decode_grpc_unary_frame(&framed).expect_err("length mismatch must be caught");
+        assert_eq!(error, "grpc frame length mismatch");
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_frame_are_ignored() {
+        let mut framed = super::encode_grpc_unary_frame(b"payload");
+        framed.extend_from_slice(b"extra");
+        assert_eq!(
+            super::decode_grpc_unary_frame(&framed).expect("decode"),
+            b"payload".to_vec(),
+            "only the declared prefix length is consumed"
+        );
+    }
+
+    #[test]
+    fn content_type_detection_requires_the_grpc_prefix() {
+        let mut headers = http::HeaderMap::new();
+        assert!(!super::is_grpc_content_type(&headers), "a missing content type is not gRPC");
+
+        for value in ["application/grpc", "application/grpc+proto", "APPLICATION/GRPC"] {
+            headers.insert(http::header::CONTENT_TYPE, value.parse().expect("value"));
+            assert!(super::is_grpc_content_type(&headers), "{value} should be gRPC");
+        }
+
+        for value in ["application/json", "text/grpc", "application/protobuf"] {
+            headers.insert(http::header::CONTENT_TYPE, value.parse().expect("value"));
+            assert!(!super::is_grpc_content_type(&headers), "{value} should not be gRPC");
+        }
+    }
+
+    // ── message sanitization ───────────────────────────────────────────
+
+    #[test]
+    fn grpc_messages_are_percent_encoded_and_stripped() {
+        assert_eq!(super::sanitize_grpc_message("bad request"), "bad%20request");
+        assert_eq!(
+            super::sanitize_grpc_message("a-b_c1"),
+            "a-b_c1",
+            "token characters pass through"
+        );
+        assert_eq!(super::sanitize_grpc_message("a.b,c;d"), "abcd", "punctuation is dropped");
+        assert_eq!(super::sanitize_grpc_message(""), "");
+        assert_eq!(super::sanitize_grpc_message("/body"), "body", "slashes are dropped");
+    }
+
+    #[test]
+    fn sanitized_grpc_messages_are_always_valid_header_values() {
+        let messages = ["line\nbreak", "null\0byte", "quote\"inside", "unicode: 路径", "tab\there"];
+        for message in messages {
+            let sanitized = super::sanitize_grpc_message(message);
+            assert!(
+                http::HeaderValue::from_str(&sanitized).is_ok(),
+                "{message:?} produced an invalid header value {sanitized:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn pointer_to_field_path_converts_json_pointers_to_dot_paths() {
+        assert_eq!(super::pointer_to_field_path("/payload/id"), "payload.id");
+        assert_eq!(super::pointer_to_field_path("/a/b/c"), "a.b.c");
+        assert_eq!(super::pointer_to_field_path("/"), "body");
+        assert_eq!(super::pointer_to_field_path(""), "body");
+        assert_eq!(super::pointer_to_field_path("/a~1b"), "a/b", "`~1` unescapes to `/`");
+        assert_eq!(super::pointer_to_field_path("/a~0b"), "a~b", "`~0` unescapes to `~`");
+    }
+
+    #[test]
+    fn field_violations_default_missing_fields() {
+        let details = json!({
+            "errors": [
+                {},
+                {"instance_pointer": "/x"},
+                {"instance_pointer": "/y", "message": "bad y"}
+            ]
+        });
+        let violations = super::extract_field_violations(&details);
+        assert_eq!(violations.len(), 3);
+        assert_eq!(violations[0].field, "body", "a missing pointer defaults to `body`");
+        assert_eq!(violations[0].description, "request validation failed");
+        assert_eq!(violations[1].field, "x");
+        assert_eq!(violations[2].description, "bad y");
+    }
+
+    #[test]
+    fn field_violations_are_empty_without_an_errors_array() {
+        assert!(super::extract_field_violations(&json!({})).is_empty());
+        assert!(super::extract_field_violations(&json!({"errors": "nope"})).is_empty());
+        assert!(super::extract_field_violations(&json!({"errors": []})).is_empty());
+    }
+
+    #[test]
+    fn status_details_without_a_list_use_the_generic_type_url() {
+        let encoded =
+            super::build_grpc_status_details_bin(13, "boom", Some(&json!({"message": "detail"})))
+                .expect("details must always encode");
+        let raw = base64::engine::general_purpose::STANDARD.decode(encoded).expect("base64");
+        let status = GoogleRpcStatus::decode(raw.as_slice()).expect("decode");
+
+        assert_eq!(status.code, 13);
+        assert_eq!(status.message, "boom");
+        assert_eq!(status.details.len(), 1);
+        assert_eq!(status.details[0].type_url, "type.googleapis.com/specmock.ValidationErrors");
+    }
+
+    #[test]
+    fn status_details_without_a_details_payload_have_no_detail_entries() {
+        let encoded = super::build_grpc_status_details_bin(0, "ok", None)
+            .expect("details must always encode");
+        let raw = base64::engine::general_purpose::STANDARD.decode(encoded).expect("base64");
+        let status = GoogleRpcStatus::decode(raw.as_slice()).expect("decode");
+        assert!(status.details.is_empty());
+        assert_eq!(status.message, "ok");
+    }
+
+    #[test]
+    fn multiple_field_violations_are_all_encoded() {
+        let details = json!({
+            "errors": [
+                {"instance_pointer": "/a", "message": "first"},
+                {"instance_pointer": "/b/c", "message": "second"}
+            ]
+        });
+        let encoded =
+            super::build_grpc_status_details_bin(3, "bad", Some(&details)).expect("details encode");
+        let raw = base64::engine::general_purpose::STANDARD.decode(encoded).expect("base64");
+        let status = GoogleRpcStatus::decode(raw.as_slice()).expect("decode");
+        let bad_request = GoogleRpcBadRequest::decode(status.details[0].value.as_slice())
+            .expect("decode bad request");
+
+        assert_eq!(bad_request.field_violations.len(), 2);
+        assert_eq!(bad_request.field_violations[0].field, "a");
+        assert_eq!(bad_request.field_violations[1].field, "b.c");
+    }
+
+    // ── error response construction ───────────────────────────────────
+
+    #[test]
+    fn error_response_sets_every_grpc_trailer() {
+        let response = super::grpc_error_response(3, "bad request", Some(json!({"errors": []})));
+        assert_eq!(
+            response.status(),
+            http::StatusCode::OK,
+            "a trailers-only gRPC response is HTTP 200"
+        );
+        assert_eq!(
+            response.headers().get(http::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/grpc")
+        );
+    }
+
+    #[test]
+    fn success_response_declares_a_zero_grpc_status() {
+        let trailers = super::success_trailers();
+        assert_eq!(trailers.get("grpc-status").and_then(|v| v.to_str().ok()), Some("0"));
+    }
+
+    // ── body framing ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn grpc_body_yields_data_frames_then_trailers_then_ends() {
+        let trailers = super::success_trailers();
+        let body = super::GrpcBody {
+            data_frames: vec![Bytes::from_static(b"a"), Bytes::from_static(b"b")],
+            trailers: Some(trailers),
+            index: 0,
+        };
+
+        let mut collected = body.collect().await.expect("body must collect");
+
+        let first = collected.frame().await.expect("first frame").expect("ok");
+        assert_eq!(first.into_data().expect("data frame").as_ref(), b"a");
+
+        let second = collected.frame().await.expect("second frame").expect("ok");
+        assert_eq!(second.into_data().expect("data frame").as_ref(), b"b");
+
+        let third = collected.frame().await.expect("trailers frame").expect("ok");
+        let trailers = third.into_trailers().expect("third frame must be trailers");
+        assert_eq!(trailers.get("grpc-status").and_then(|v| v.to_str().ok()), Some("0"));
+
+        assert!(collected.frame().await.is_none(), "the body ends after the trailers frame");
+    }
+
+    #[tokio::test]
+    async fn grpc_body_with_no_data_frames_starts_with_trailers() {
+        let body = super::GrpcBody {
+            data_frames: Vec::new(),
+            trailers: Some(super::success_trailers()),
+            index: 0,
+        };
+        let mut collected = body.collect().await.expect("collect");
+        let frame = collected.frame().await.expect("a trailers frame must be present");
+        let frame = frame.expect("the frame must not carry an error");
+        assert!(
+            frame.into_trailers().is_ok(),
+            "a trailers-only response must yield a trailers frame"
+        );
+        assert!(collected.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn grpc_body_without_trailers_ends_after_the_data() {
+        let body = super::GrpcBody {
+            data_frames: vec![Bytes::from_static(b"x")],
+            trailers: None,
+            index: 0,
+        };
+        let mut collected = body.collect().await.expect("collect");
+        assert!(collected.frame().await.expect("frame").is_ok());
+        assert!(collected.frame().await.is_none(), "no trailers frame is produced");
+    }
+
+    // ── runtime construction ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn grpc_runtime_requires_a_proto_spec() {
+        let config = crate::ServerConfig::default();
+        let error = GrpcRuntime::from_config(&config).await.expect_err("proto_spec is required");
+        assert!(error.to_string().contains("proto_spec must be set"), "got {error}");
+    }
+
+    #[tokio::test]
+    async fn grpc_runtime_reports_compile_errors() {
+        let config = crate::ServerConfig {
+            proto_spec: Some(std::path::PathBuf::from("/definitely/not/a/real/spec.proto")),
+            ..Default::default()
+        };
+        let error = GrpcRuntime::from_config(&config).await.expect_err("compile must fail");
+        assert!(matches!(error, crate::RuntimeError::Parse(_)), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn grpc_runtime_registers_every_method_path() {
+        let spec =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/specs/greeter.proto");
+        let config = crate::ServerConfig { proto_spec: Some(spec), ..Default::default() };
+        let runtime = GrpcRuntime::from_config(&config).await.expect("runtime");
+
+        assert!(
+            runtime.methods.contains_key("/mock.Greeter/SayHello"),
+            "unary methods are registered by full path, got {:?}",
+            runtime.methods.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // ── property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Recursive strategy for arbitrary JSON values.
+    ///
+    /// `serde_json::Value` does not implement `proptest::Arbitrary`, so the
+    /// generator is assembled from bounded leaf and container shapes.
+    fn any_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            any::<bool>().prop_map(serde_json::Value::from),
+            any::<i64>().prop_map(serde_json::Value::from),
+            "[ -~]{0,8}".prop_map(serde_json::Value::from),
+        ];
+        leaf.prop_recursive(3, 12, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map("[a-z]{1,6}", inner, 0..4).prop_map(|members| {
+                    let map: serde_json::Map<String, serde_json::Value> =
+                        members.into_iter().collect();
+                    serde_json::Value::Object(map)
+                }),
+            ]
+        })
+    }
+
+    // `rustfmt` cannot parse the `proptest!` DSL, so this block is left verbatim.
+
+    #[rustfmt::skip]
+
+    proptest! {
+        /// Whatever bytes arrive on the wire, decoding either succeeds or fails
+        /// with a known message — it never panics and never over-reads.
+        #[test]
+        fn frame_decoding_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..64))
+        {
+            if let Ok(payload) = super::decode_grpc_unary_frame(&bytes) {
+                // A decoded payload is always a slice of the input, taken after
+                // the 5-byte prefix, and never longer than the remaining input.
+                prop_assert!(bytes.len() >= payload.len() + 5);
+                prop_assert_eq!(&bytes[5..5 + payload.len()], payload.as_slice());
+                prop_assert_eq!(bytes[0], 0, "only an uncompressed frame decodes");
+            }
+        }
+
+        /// Encoding then decoding is always the identity.
+        #[test]
+        fn frame_round_trip_is_the_identity(
+            payload in prop::collection::vec(any::<u8>(), 0..256)
+        ) {
+            let framed = super::encode_grpc_unary_frame(&payload);
+            prop_assert_eq!(super::decode_grpc_unary_frame(&framed).expect("decode"), payload);
+        }
+
+        /// Whatever the raw text, gRPC message sanitization always yields a
+        /// valid HTTP header value.
+        #[test]
+        fn sanitization_always_yields_a_valid_header_value(
+            message in "[ -~]{0,60}"
+        ) {
+            let sanitized = super::sanitize_grpc_message(&message);
+            prop_assert!(
+                http::HeaderValue::from_str(&sanitized).is_ok(),
+                "invalid header value {sanitized:?} from {message:?}"
+            );
+        }
+
+        /// Pointer-to-field conversion is total and never produces an empty
+        /// path, so a `BadRequest` always carries an addressable field.
+        #[test]
+        fn pointer_conversion_is_total(pointer in "[/a-zA-Z0-9~]{0,30}")
+        {
+            let field = super::pointer_to_field_path(&pointer);
+            prop_assert!(!field.is_empty(), "empty field for pointer {:?}", pointer);
+        }
+
+        /// Status details always encode to decodable base64 protobuf.
+        #[test]
+        fn status_details_always_round_trip(
+            code in -20i32..20,
+            message in "[ -~]{0,40}",
+            details in prop::option::of(any_json()),
+        ) {
+            let encoded = super::build_grpc_status_details_bin(code, &message, details.as_ref())
+                .expect("details must always encode");
+            let raw = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .expect("base64 must decode");
+            let status = GoogleRpcStatus::decode(raw.as_slice()).expect("protobuf must decode");
+            prop_assert_eq!(status.code, code);
+            prop_assert_eq!(status.message.clone(), message);
+        }
+
+        /// Whatever JSON arrives, field-violation extraction is total.
+        #[test]
+        fn field_violation_extraction_never_panics(details in any_json()) {
+            let _ = super::extract_field_violations(&details);
+        }
     }
 }

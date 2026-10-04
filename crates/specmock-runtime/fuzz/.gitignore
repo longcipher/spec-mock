@@ -1,0 +1,5 @@
+# Ignore the fuzz build artifacts and the corpus/crash artefacts libFuzzer writes.
+target
+corpus
+artifacts
+coverage

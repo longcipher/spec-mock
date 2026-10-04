@@ -162,13 +162,17 @@ fn keyword_from_schema_path(schema_path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{LazyLock, Mutex, MutexGuard};
+    use std::{
+        collections::BTreeSet,
+        sync::{LazyLock, Mutex, MutexGuard},
+    };
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         cached_validator_address_for_tests, cached_validator_count_for_tests,
-        clear_validator_cache_for_tests, set_validator_cache_max_for_tests, validate_instance,
+        clear_validator_cache_for_tests, keyword_from_schema_path,
+        set_validator_cache_max_for_tests, validate_instance,
     };
 
     static VALIDATOR_CACHE_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(Mutex::default);
@@ -350,5 +354,310 @@ mod tests {
             cached_validator_address_for_tests(&nested).is_some(),
             "deeply nested schemas must still be cached"
         );
+    }
+
+    #[test]
+    fn keyword_is_derived_from_the_schema_path_tail() {
+        assert_eq!(keyword_from_schema_path("/properties/id/type"), "type");
+        assert_eq!(keyword_from_schema_path("/required"), "required");
+        assert_eq!(keyword_from_schema_path("/items/minItems"), "minItems");
+    }
+
+    #[test]
+    fn keyword_falls_back_to_unknown_for_a_blank_schema_path() {
+        assert_eq!(keyword_from_schema_path(""), "unknown");
+        assert_eq!(keyword_from_schema_path("/"), "unknown");
+        assert_eq!(keyword_from_schema_path("///"), "unknown");
+    }
+
+    // ── issue reporting ────────────────────────────────────────────────
+
+    #[test]
+    fn type_mismatch_reports_populated_pointers_and_keyword() {
+        let schema = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        let issues = validate_instance(&schema, &json!({"id": "not-a-number"}))
+            .expect("schema should compile");
+
+        let issue = issues.first().expect("a type mismatch must produce an issue");
+        assert_eq!(issue.instance_pointer, "/id");
+        assert_eq!(issue.keyword, "type");
+        assert!(issue.schema_pointer.contains("properties"), "got {}", issue.schema_pointer);
+        assert!(!issue.message.is_empty(), "every issue must carry a message");
+    }
+
+    #[test]
+    fn every_failing_keyword_is_reported() {
+        let schema = json!({
+            "type": "object",
+            "required": ["a", "b"],
+            "properties": {
+                "a": {"type": "integer"},
+                "b": {"type": "string"}
+            }
+        });
+        let issues = validate_instance(&schema, &json!({})).expect("schema should compile");
+        let keywords: BTreeSet<&str> = issues.iter().map(|issue| issue.keyword.as_str()).collect();
+        assert_eq!(
+            keywords,
+            BTreeSet::from(["required"]),
+            "with no properties to type-check, only `required` can fail"
+        );
+        assert_eq!(issues.len(), 2, "both missing properties are reported separately");
+    }
+
+    #[test]
+    fn required_and_type_violations_are_reported_together() {
+        let schema = json!({
+            "type": "object",
+            "required": ["b"],
+            "properties": {"a": {"type": "integer"}}
+        });
+        let issues =
+            validate_instance(&schema, &json!({"a": "wrong"})).expect("schema should compile");
+        let keywords: BTreeSet<&str> = issues.iter().map(|issue| issue.keyword.as_str()).collect();
+        assert_eq!(
+            keywords,
+            BTreeSet::from(["required", "type"]),
+            "a missing required property and a wrong property type must both be reported"
+        );
+    }
+
+    #[test]
+    fn root_level_violation_uses_the_empty_instance_pointer() {
+        let schema = json!({"type": "string"});
+        let issues = validate_instance(&schema, &json!(42)).expect("schema should compile");
+        let issue = issues.first().expect("a root violation must produce an issue");
+        assert_eq!(issue.instance_pointer, "", "a root violation has no instance path");
+    }
+
+    #[test]
+    fn array_item_violation_points_at_the_index() {
+        let schema = json!({"type": "array", "items": {"type": "integer"}});
+        let issues =
+            validate_instance(&schema, &json!([1, "two", 3])).expect("schema should compile");
+        let issue = issues.first().expect("an item violation must produce an issue");
+        assert_eq!(issue.instance_pointer, "/1", "the failing index must be reported");
+    }
+
+    #[test]
+    fn valid_instance_reports_no_issues() {
+        let schema = json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {"id": {"type": "integer", "minimum": 1}}
+        });
+        let issues = validate_instance(&schema, &json!({"id": 5})).expect("schema should compile");
+        assert!(issues.is_empty(), "a conforming instance must not report issues");
+    }
+
+    #[test]
+    fn empty_schema_accepts_everything() {
+        let issues = validate_instance(&json!({}), &json!({"anything": [1, 2, 3]}))
+            .expect("empty schema should compile");
+        assert!(issues.is_empty(), "an empty schema must not reject anything");
+    }
+
+    #[test]
+    fn invalid_schema_is_reported_as_a_compilation_error() {
+        let error = validate_instance(&json!({"type": 42}), &json!(null))
+            .expect_err("a non-string `type` must fail to compile");
+        let message = error.to_string();
+        assert!(message.contains("schema compilation failed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn deeply_nested_schema_path_is_preserved() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "level1": {
+                    "type": "object",
+                    "properties": {
+                        "level2": {"type": "integer"}
+                    }
+                }
+            }
+        });
+        let issues = validate_instance(&schema, &json!({"level1": {"level2": "bad"}}))
+            .expect("schema should compile");
+        let issue = issues.first().expect("a nested violation must produce an issue");
+        assert_eq!(issue.instance_pointer, "/level1/level2");
+        assert!(issue.schema_pointer.contains("level2"), "got {}", issue.schema_pointer);
+    }
+
+    #[test]
+    fn pattern_violation_reports_the_pattern_keyword() {
+        let schema = json!({"type": "string", "pattern": "^[0-9]+$"});
+        let issues = validate_instance(&schema, &json!("abc")).expect("schema should compile");
+        let issue = issues.first().expect("a pattern violation must produce an issue");
+        assert_eq!(issue.keyword, "pattern");
+    }
+
+    // ── hashing ────────────────────────────────────────────────────────
+
+    use super::hash_value;
+
+    #[test]
+    fn hash_distinguishes_every_json_variant() {
+        let values = [
+            Value::Null,
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::from(0),
+            Value::from(1),
+            Value::from(1.5),
+            Value::String(String::new()),
+            Value::String("0".to_owned()),
+            Value::String("true".to_owned()),
+            Value::Array(vec![]),
+            Value::Object(serde_json::Map::new()),
+        ];
+
+        for (index, left) in values.iter().enumerate() {
+            for (other_index, right) in values.iter().enumerate() {
+                if index != other_index {
+                    assert_ne!(
+                        hash_value(left),
+                        hash_value(right),
+                        "{left} and {right} must not collide"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hash_ignores_object_member_ordering() {
+        let first = json!({"a": 1, "b": [1, 2], "c": {"d": true}});
+        let reordered = json!({"c": {"d": true}, "b": [1, 2], "a": 1});
+        assert_eq!(hash_value(&first), hash_value(&reordered));
+    }
+
+    #[test]
+    fn hash_is_sensitive_to_array_ordering() {
+        assert_ne!(hash_value(&json!([1, 2])), hash_value(&json!([2, 1])));
+    }
+
+    #[test]
+    fn hash_is_sensitive_to_member_counts() {
+        assert_ne!(hash_value(&json!([])), hash_value(&json!([null])));
+        assert_ne!(hash_value(&json!({})), hash_value(&json!({"a": null})));
+    }
+
+    #[test]
+    fn hash_is_stable_across_calls() {
+        let schema = json!({"type": "object", "properties": {"id": {"type": "integer"}}});
+        assert_eq!(hash_value(&schema), hash_value(&schema));
+    }
+
+    // ── property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Recursive strategy for arbitrary JSON values.
+    ///
+    /// `serde_json::Value` does not implement `proptest::Arbitrary`, so the
+    /// generator is assembled from bounded leaf and container shapes.
+    fn any_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            "[ -~]{0,8}".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(3, 12, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::hash_map("[a-z]{1,6}", inner, 0..4).prop_map(|members| {
+                    let map: serde_json::Map<String, Value> = members.into_iter().collect();
+                    Value::Object(map)
+                }),
+            ]
+        })
+    }
+
+    // `rustfmt` cannot parse the `proptest!` DSL, so this block is left verbatim.
+
+    #[rustfmt::skip]
+
+    proptest! {
+        /// Member reordering must never change the cache key, so structurally
+        /// equal documents always share one compiled validator.
+        #[test]
+        fn member_reordering_does_not_change_the_hash(
+            members in prop::collection::hash_map(
+                "[a-z]{1,5}",
+                prop_oneof![any::<i64>().prop_map(Value::from), "[a-z]{0,4}".prop_map(Value::from)],
+                1..5,
+            )
+        ) {
+            // `serde_json::Map` stores members in sorted order, so inserting the same
+            // entries in reverse yields the identical map — which is exactly the
+            // invariant the cache key relies on.
+            let entries: Vec<(String, Value)> =
+                members.iter().map(|(key, value)| (key.clone(), value.clone())).collect();
+            let forward: serde_json::Map<String, Value> =
+                entries.iter().cloned().collect();
+            let reversed: serde_json::Map<String, Value> =
+                entries.iter().rev().cloned().collect();
+
+            prop_assert_eq!(
+                hash_value(&Value::Object(forward)),
+                hash_value(&Value::Object(reversed))
+            );
+        }
+
+        /// A one-token change anywhere in the tree must change the key, so two
+        /// schemas that differ only in a leaf constraint never share a
+        /// validator (which would silently enforce the wrong constraint).
+        #[test]
+        fn a_single_leaf_change_changes_the_hash(
+            base in 0i64..1000,
+            other in 0i64..1000,
+        ) {
+            prop_assume!(base != other);
+            let left = json!({"type": "object", "properties": {"id": {"type": "integer", "minimum": base}}});
+            let right = json!({"type": "object", "properties": {"id": {"type": "integer", "minimum": other}}});
+            prop_assert_ne!(hash_value(&left), hash_value(&right));
+        }
+
+        /// Whatever the schema, hashing must be total and never panic.
+        #[test]
+        fn hashing_never_panics(schema in any_json())
+        {
+            let first = hash_value(&schema);
+            let second = hash_value(&schema);
+            prop_assert_eq!(first, second);
+        }
+
+        /// `keyword_from_schema_path` must always return a non-empty label.
+        #[test]
+        fn keyword_is_never_empty(schema_path in "[a-zA-Z0-9#/]{0,24}")
+        {
+            prop_assert!(!keyword_from_schema_path(&schema_path).is_empty());
+        }
+
+        /// Validation over any schema/instance pair either succeeds or fails,
+        /// but must never panic — this is the property the whole HTTP and WS
+        /// runtime relies on for hostile input.
+        #[test]
+        fn validation_never_panics(schema in any_json(), instance in any_json())
+        {
+            let _ = validate_instance(&schema, &instance);
+        }
+
+        /// When validation succeeds, every reported issue must be fully
+        /// populated so callers can render it into RFC 7807 output.
+        #[test]
+        fn successful_validation_returns_well_formed_issues(
+            schema in any_json(),
+            instance in any_json(),
+        ) {
+            if let Ok(issues) = validate_instance(&schema, &instance) {
+                for issue in issues {
+                    prop_assert!(!issue.keyword.is_empty());
+                    prop_assert!(!issue.message.is_empty());
+                }
+            }
+        }
     }
 }

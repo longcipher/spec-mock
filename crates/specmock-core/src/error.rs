@@ -224,4 +224,83 @@ mod tests {
     fn content_type_constant() {
         assert_eq!(PROBLEM_JSON_CONTENT_TYPE, "application/problem+json");
     }
+
+    #[test]
+    fn unmapped_status_falls_back_to_a_generic_title() {
+        assert_eq!(title_for_status(0), "Unknown Error");
+        assert_eq!(title_for_status(418), "Unknown Error");
+        assert_eq!(title_for_status(999), "Unknown Error");
+        assert_eq!(title_for_status(u16::MAX), "Unknown Error");
+    }
+
+    #[test]
+    fn every_mapped_status_has_a_distinct_reason_phrase() {
+        let statuses = [400, 401, 403, 404, 405, 406, 409, 413, 415, 422, 429, 500, 502, 503];
+
+        let mut seen = std::collections::BTreeSet::new();
+        for status in statuses {
+            let title = title_for_status(status);
+            assert_ne!(title, "Unknown Error", "{status} should be mapped");
+            assert!(seen.insert(title), "{status} reuses the title {title:?}");
+        }
+    }
+
+    #[test]
+    fn validation_error_preserves_every_issue() {
+        let issues = vec![
+            ValidationIssue {
+                instance_pointer: "/a".to_owned(),
+                schema_pointer: "#/a".to_owned(),
+                keyword: "type".to_owned(),
+                message: "first".to_owned(),
+            },
+            ValidationIssue {
+                instance_pointer: "/b".to_owned(),
+                schema_pointer: "#/b".to_owned(),
+                keyword: "required".to_owned(),
+                message: "second".to_owned(),
+            },
+        ];
+
+        let problem = ProblemDetails::validation_error(400, issues.clone());
+        assert_eq!(problem.errors, issues, "no issue may be dropped or reordered");
+    }
+
+    #[test]
+    fn non_validation_constructors_never_carry_errors() {
+        for problem in [
+            ProblemDetails::not_found("a"),
+            ProblemDetails::unsupported_media_type("b"),
+            ProblemDetails::not_acceptable("c"),
+            ProblemDetails::payload_too_large("d"),
+        ] {
+            assert!(problem.errors.is_empty());
+            assert_eq!(problem.problem_type, "about:blank");
+            assert!(problem.instance.is_none());
+        }
+    }
+
+    #[test]
+    fn instance_is_omitted_from_serialization_when_absent() {
+        let problem = ProblemDetails::not_found("gone");
+        let value = serde_json::to_value(&problem).expect("to_value");
+        assert!(value.get("instance").is_none());
+        assert_eq!(value.get("detail").and_then(serde_json::Value::as_str), Some("gone"));
+    }
+
+    #[test]
+    fn error_variants_render_their_payload() {
+        assert_eq!(
+            SpecMockCoreError::Schema("bad".to_owned()).to_string(),
+            "schema compilation failed: bad"
+        );
+        assert_eq!(
+            SpecMockCoreError::Faker("bad".to_owned()).to_string(),
+            "data generation failed: bad"
+        );
+        assert_eq!(
+            SpecMockCoreError::Ref("bad".to_owned()).to_string(),
+            "$ref resolution failed: bad"
+        );
+    }
 }

@@ -939,7 +939,7 @@ fn parse_status_code(status: &str) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use http::{HeaderMap, Method};
     use serde_json::json;
@@ -1306,5 +1306,1483 @@ mod tests {
     fn callback_url_only_non_body_tokens() {
         let result = super::resolve_callback_url("{$method}/{$url}/notify", None);
         assert_eq!(result.as_deref(), Some("{$method}/{$url}/notify"));
+    }
+
+    // ── document validation ────────────────────────────────────────────
+
+    #[test]
+    fn missing_openapi_version_is_rejected() {
+        let error = OpenApiRuntime::from_resolved(serde_json::json!({"paths": {}}))
+            .expect_err("a version field is required");
+        assert!(error.to_string().contains("version field missing"), "got {error}");
+    }
+
+    #[test]
+    fn non_string_openapi_version_is_rejected() {
+        let error = OpenApiRuntime::from_resolved(serde_json::json!({"openapi": 3, "paths": {}}))
+            .expect_err("a numeric version is not a string");
+        assert!(error.to_string().contains("version field missing"), "got {error}");
+    }
+
+    #[test]
+    fn unsupported_openapi_version_is_rejected() {
+        for version in ["2.0", "4.0.0", "swagger"] {
+            let error =
+                OpenApiRuntime::from_resolved(serde_json::json!({"openapi": version, "paths": {}}))
+                    .expect_err("unsupported version must be rejected");
+            assert!(
+                error.to_string().contains("unsupported openapi version"),
+                "{version}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn supported_openapi_versions_are_accepted() {
+        for version in ["3.0.0", "3.0.3", "3.1.0", "3.1.1"] {
+            let runtime =
+                OpenApiRuntime::from_resolved(serde_json::json!({"openapi": version, "paths": {}}))
+                    .unwrap_or_else(|error| panic!("{version} should be accepted: {error}"));
+            assert!(runtime.match_operation(&Method::GET, "/anything").is_none());
+        }
+    }
+
+    #[test]
+    fn missing_paths_object_is_rejected() {
+        let error = OpenApiRuntime::from_resolved(serde_json::json!({"openapi": "3.1.0"}))
+            .expect_err("paths is required");
+        assert!(error.to_string().contains("paths object missing"), "got {error}");
+    }
+
+    #[test]
+    fn non_object_paths_is_rejected() {
+        let error = OpenApiRuntime::from_resolved(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": ["/pets"]
+        }))
+        .expect_err("paths must be an object");
+        assert!(error.to_string().contains("paths object missing"), "got {error}");
+    }
+
+    #[test]
+    fn non_object_path_items_are_skipped() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/broken": "not an object",
+                "/null": null,
+                "/pets": {"get": {"responses": {"200": {"description": "ok"}}}}
+            }
+        }));
+
+        assert!(runtime.match_operation(&Method::GET, "/broken").is_none());
+        assert!(runtime.match_operation(&Method::GET, "/null").is_none());
+        assert!(runtime.match_operation(&Method::GET, "/pets").is_some());
+    }
+
+    #[test]
+    fn non_object_operations_are_skipped() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets": {
+                    "get": "not an operation object",
+                    "post": 42,
+                    "delete": {"responses": {"200": {"description": "ok"}}}
+                }
+            }
+        }));
+
+        assert!(runtime.match_operation(&Method::GET, "/pets").is_none());
+        assert!(runtime.match_operation(&Method::POST, "/pets").is_none());
+        assert!(runtime.match_operation(&Method::DELETE, "/pets").is_some());
+    }
+
+    #[test]
+    fn every_supported_method_key_is_parsed() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/thing": {
+                    "get": {"responses": {"200": {"description": "ok"}}},
+                    "put": {"responses": {"200": {"description": "ok"}}},
+                    "patch": {"responses": {"200": {"description": "ok"}}},
+                    "delete": {"responses": {"200": {"description": "ok"}}},
+                    "head": {"responses": {"200": {"description": "ok"}}},
+                    "options": {"responses": {"200": {"description": "ok"}}},
+                    "trace": {"responses": {"200": {"description": "ok"}}}
+                }
+            }
+        }));
+
+        for method in [
+            Method::GET,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::HEAD,
+            Method::OPTIONS,
+            Method::TRACE,
+        ] {
+            assert!(
+                runtime.match_operation(&method, "/thing").is_some(),
+                "{method} should be routed"
+            );
+        }
+    }
+
+    // ── parameter parsing ──────────────────────────────────────────────
+
+    #[test]
+    fn malformed_parameters_are_skipped() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets": {
+                    "get": {
+                        "parameters": [
+                            "not an object",
+                            {"in": "query"},
+                            {"name": "x"},
+                            {"name": "y", "in": "cookie"},
+                            {"name": "limit", "in": "query"}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let matched = runtime.match_operation(&Method::GET, "/pets").expect("matched");
+        let parameters = &matched.operation.parameters;
+        assert_eq!(parameters.len(), 1, "only the well-formed parameter survives");
+        assert_eq!(parameters[0].name, "limit");
+    }
+
+    #[test]
+    fn non_array_parameters_yield_an_empty_list() {
+        let parsed =
+            super::parse_parameters(Some(&serde_json::json!("nope")), "3.1.0").expect("parse");
+        assert!(parsed.is_empty());
+        assert!(super::parse_parameters(None, "3.1.0").expect("parse").is_empty());
+    }
+
+    #[test]
+    fn path_parameters_are_implicitly_required() {
+        let parsed = super::parse_parameters(
+            Some(&serde_json::json!([{"name": "id", "in": "path", "schema": {"type": "string"}}])),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert!(parsed[0].required, "OpenAPI requires every path parameter to be required");
+    }
+
+    #[test]
+    fn parameters_without_a_schema_default_to_any() {
+        let parsed = super::parse_parameters(
+            Some(&serde_json::json!([{"name": "q", "in": "query"}])),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert!(parsed[0].schema.as_object().expect("schema object").is_empty());
+        assert!(!parsed[0].required);
+    }
+
+    // ── nullable normalization ─────────────────────────────────────────
+
+    #[test]
+    fn nullable_string_type_becomes_a_union_for_openapi_30() {
+        let parsed = super::parse_parameters(
+            Some(&serde_json::json!([{
+                "name": "nickname",
+                "in": "query",
+                "schema": {"type": "string", "nullable": true}
+            }])),
+            "3.0.3",
+        )
+        .expect("parse");
+
+        assert_eq!(parsed[0].schema["type"], serde_json::json!(["string", "null"]));
+        assert!(
+            parsed[0].schema.get("nullable").is_none(),
+            "the `nullable` keyword must be consumed by the transform"
+        );
+    }
+
+    #[test]
+    fn nullable_union_type_gains_null_without_duplicating() {
+        let parsed = super::parse_parameters(
+            Some(&serde_json::json!([{
+                "name": "x",
+                "in": "query",
+                "schema": {"type": ["string", "null"], "nullable": true}
+            }])),
+            "3.0.3",
+        )
+        .expect("parse");
+        assert_eq!(parsed[0].schema["type"], serde_json::json!(["string", "null"]));
+    }
+
+    #[test]
+    fn nullable_is_ignored_for_openapi_31() {
+        let parsed = super::parse_parameters(
+            Some(&serde_json::json!([{
+                "name": "nickname",
+                "in": "query",
+                "schema": {"type": "string", "nullable": true}
+            }])),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert_eq!(parsed[0].schema["type"], serde_json::json!("string"), "3.1 has no `nullable`");
+        assert_eq!(parsed[0].schema["nullable"], serde_json::json!(true), "left untouched");
+    }
+
+    #[test]
+    fn nullable_with_a_non_string_type_is_left_alone() {
+        let mut schema = serde_json::json!({"type": 42, "nullable": true});
+        super::normalize_schema(&mut schema, true);
+        assert_eq!(schema["type"], serde_json::json!(42), "an untyped `type` is not rewritten");
+        assert!(schema.get("nullable").is_none(), "the keyword is still consumed");
+    }
+
+    #[test]
+    fn normalize_schema_recurses_into_every_known_keyword() {
+        let mut schema = serde_json::json!({
+            "properties": {
+                "a": {"type": "string", "nullable": true},
+                "b": {"type": "integer"}
+            },
+            "$defs": {"C": {"type": "string", "nullable": true}},
+            "definitions": {"D": {"type": "string", "nullable": true}},
+            "items": {"type": "string", "nullable": true},
+            "additionalProperties": {"type": "string", "nullable": true},
+            "not": {"type": "string", "nullable": true},
+            "allOf": [{"type": "string", "nullable": true}],
+            "anyOf": [{"type": "string", "nullable": true}],
+            "oneOf": [{"type": "string", "nullable": true}]
+        });
+
+        super::normalize_schema(&mut schema, true);
+
+        for pointer in [
+            "/properties/a/type",
+            "/$defs/C/type",
+            "/definitions/D/type",
+            "/items/type",
+            "/additionalProperties/type",
+            "/not/type",
+            "/allOf/0/type",
+            "/anyOf/0/type",
+            "/oneOf/0/type",
+        ] {
+            assert_eq!(
+                schema.pointer(pointer),
+                Some(&serde_json::json!(["string", "null"])),
+                "{pointer} must be normalized"
+            );
+        }
+        assert_eq!(
+            schema.pointer("/properties/b/type"),
+            Some(&serde_json::json!("integer")),
+            "a schema without `nullable` is untouched"
+        );
+    }
+
+    #[test]
+    fn normalize_schema_ignores_non_object_schemas() {
+        for mut scalar in [serde_json::json!(5), serde_json::json!("x"), serde_json::json!([1, 2])]
+        {
+            let before = scalar.clone();
+            super::normalize_schema(&mut scalar, true);
+            assert_eq!(scalar, before);
+        }
+    }
+
+    #[test]
+    fn normalize_schema_skips_malformed_nested_containers() {
+        // `properties` that is not an object, `items` that is absent, etc.
+        let mut schema = serde_json::json!({"properties": ["not", "an", "object"]});
+        super::normalize_schema(&mut schema, true);
+        assert_eq!(schema, serde_json::json!({"properties": ["not", "an", "object"]}));
+
+        let mut schema = serde_json::json!({"allOf": "not an array"});
+        super::normalize_schema(&mut schema, true);
+        assert_eq!(schema, serde_json::json!({"allOf": "not an array"}));
+    }
+
+    // ── parameter value coercion ───────────────────────────────────────
+
+    #[test]
+    fn parameter_values_are_coerced_to_the_declared_type() {
+        let cases = [
+            (serde_json::json!({"type": "integer"}), "42", serde_json::json!(42)),
+            (serde_json::json!({"type": "number"}), "4.5", serde_json::json!(4.5)),
+            (serde_json::json!({"type": "boolean"}), "true", serde_json::json!(true)),
+            (serde_json::json!({"type": "string"}), "7", serde_json::json!("7")),
+        ];
+        for (schema, raw, expected) in cases {
+            assert_eq!(super::parse_parameter_value(raw, &schema), expected);
+        }
+    }
+
+    #[test]
+    fn uncoercible_parameter_values_stay_strings() {
+        let cases = [
+            serde_json::json!({"type": "integer"}),
+            serde_json::json!({"type": "number"}),
+            serde_json::json!({"type": "boolean"}),
+        ];
+        for schema in cases {
+            assert_eq!(
+                super::parse_parameter_value("not-a-number", &schema),
+                serde_json::json!("not-a-number"),
+                "an uncoercible value must be surfaced as a string so validation can reject it"
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_value_defaults_to_a_string() {
+        assert_eq!(
+            super::parse_parameter_value("7", &serde_json::json!({})),
+            serde_json::json!("7")
+        );
+        assert_eq!(
+            super::parse_parameter_value("7", &serde_json::json!(42)),
+            serde_json::json!("7")
+        );
+    }
+
+    #[test]
+    fn parameter_value_uses_the_first_entry_of_a_union_type() {
+        let schema = serde_json::json!({"type": ["integer", "null"]});
+        assert_eq!(super::parse_parameter_value("5", &schema), serde_json::json!(5));
+
+        // `null` is not a coercible scalar type, so the raw string is kept and
+        // the parameter schema — not the coercion — decides whether it is valid.
+        let null_first = serde_json::json!({"type": ["null", "integer"]});
+        assert_eq!(super::parse_parameter_value("5", &null_first), serde_json::json!("5"));
+    }
+
+    #[test]
+    fn schema_type_is_array_detects_both_encodings() {
+        assert!(super::schema_type_is_array(&serde_json::json!({"type": "array"})));
+        assert!(super::schema_type_is_array(&serde_json::json!({"type": ["null", "array"]})));
+        assert!(!super::schema_type_is_array(&serde_json::json!({"type": "string"})));
+        assert!(!super::schema_type_is_array(&serde_json::json!({})));
+        assert!(!super::schema_type_is_array(&serde_json::json!({"type": 5})));
+    }
+
+    // ── status codes ───────────────────────────────────────────────────
+
+    #[test]
+    fn status_codes_are_parsed_with_a_default_fallback() {
+        assert_eq!(super::parse_status_code("200"), 200);
+        assert_eq!(super::parse_status_code("599"), 599);
+        assert_eq!(super::parse_status_code("default"), 200, "`default` maps onto 200");
+        assert_eq!(super::parse_status_code("2XX"), 200, "an unparsable status falls back to 200");
+        assert_eq!(super::parse_status_code(""), 200);
+    }
+
+    // ── request validation ─────────────────────────────────────────────
+
+    #[test]
+    fn missing_required_path_parameter_is_reported() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/pets/{id}": {
+                    "get": {
+                        "parameters": [
+                            {"name": "id", "in": "path", "required": true, "schema": {"type": "integer"}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/pets/1").expect("matched").operation;
+
+        let issues = operation.validate_request(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HeaderMap::new(),
+            None,
+            false,
+        );
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].keyword, "required");
+        assert_eq!(issues[0].instance_pointer, "/id");
+    }
+
+    #[test]
+    fn missing_required_query_and_header_parameters_are_reported() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            {"name": "limit", "in": "query", "required": true, "schema": {"type": "integer"}},
+                            {"name": "x-trace", "in": "header", "required": true, "schema": {"type": "string"}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/search").expect("matched").operation;
+        let issues = operation.validate_request(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HeaderMap::new(),
+            None,
+            false,
+        );
+
+        let pointers: BTreeSet<String> =
+            issues.iter().map(|issue| issue.instance_pointer.clone()).collect();
+        assert!(pointers.contains("/limit"), "got {pointers:?}");
+        assert!(pointers.contains("/x-trace"), "got {pointers:?}");
+    }
+
+    #[test]
+    fn optional_parameters_absent_are_not_reported() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            {"name": "limit", "in": "query", "schema": {"type": "integer"}},
+                            {"name": "x-trace", "in": "header", "schema": {"type": "string"}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/search").expect("matched").operation;
+        assert!(
+            operation
+                .validate_request(&HashMap::new(), &HashMap::new(), &HeaderMap::new(), None, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn parameter_schema_violations_are_reported() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            {"name": "limit", "in": "query", "required": true, "schema": {"type": "integer"}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/search").expect("matched").operation;
+
+        let mut query = HashMap::new();
+        query.insert("limit".to_owned(), vec!["not-a-number".to_owned()]);
+        let issues =
+            operation.validate_request(&HashMap::new(), &query, &HeaderMap::new(), None, false);
+
+        assert!(!issues.is_empty(), "a non-integer limit must be rejected: {issues:?}");
+        assert_eq!(issues.len(), 1, "exactly one violation, got {issues:?}");
+        // The coerced scalar is validated on its own, so the instance pointer
+        // is the (empty) root rather than the query key.
+        assert_eq!(issues[0].keyword, "type");
+    }
+
+    #[test]
+    fn array_query_parameter_collects_every_value() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            {
+                                "name": "tag",
+                                "in": "query",
+                                "required": true,
+                                "schema": {"type": "array", "items": {"type": "integer"}}
+                            }
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/search").expect("matched").operation;
+
+        let mut query = HashMap::new();
+        query.insert("tag".to_owned(), vec!["1".to_owned(), "2".to_owned()]);
+        assert!(
+            operation
+                .validate_request(&HashMap::new(), &query, &HeaderMap::new(), None, false)
+                .is_empty()
+        );
+
+        // One bad element fails the whole array.
+        query.insert("tag".to_owned(), vec!["1".to_owned(), "oops".to_owned()]);
+        assert!(
+            !operation
+                .validate_request(&HashMap::new(), &query, &HeaderMap::new(), None, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn array_query_parameter_without_items_schema_accepts_anything() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/search": {
+                    "get": {
+                        "parameters": [
+                            {"name": "tag", "in": "query", "required": true, "schema": {"type": "array"}}
+                        ],
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::GET, "/search").expect("matched").operation;
+        let mut query = HashMap::new();
+        query.insert("tag".to_owned(), vec!["anything".to_owned()]);
+        assert!(
+            operation
+                .validate_request(&HashMap::new(), &query, &HeaderMap::new(), None, false)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn required_body_must_be_present() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/items": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": {"application/json": {"schema": {"type": "object"}}}
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::POST, "/items").expect("matched").operation;
+
+        let issues = operation.validate_request(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HeaderMap::new(),
+            None,
+            false,
+        );
+        assert!(issues.iter().any(|issue| issue.message.contains("missing required request body")));
+
+        // A non-JSON body still satisfies `required`.
+        assert!(
+            operation
+                .validate_request(&HashMap::new(), &HashMap::new(), &HeaderMap::new(), None, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn body_schema_violations_are_reported() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/items": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": {
+                                        "type": "object",
+                                        "required": ["name"],
+                                        "properties": {"name": {"type": "string"}}
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::POST, "/items").expect("matched").operation;
+
+        let issues = operation.validate_request(
+            &HashMap::new(),
+            &HashMap::new(),
+            &HeaderMap::new(),
+            Some(&serde_json::json!({})),
+            true,
+        );
+        assert!(!issues.is_empty(), "a body missing `name` must be rejected");
+    }
+
+    #[test]
+    fn non_json_request_body_content_is_accepted_without_schema_checks() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/upload": {
+                    "post": {
+                        "requestBody": {
+                            "required": true,
+                            "content": {"text/plain": {"schema": {"type": "string"}}}
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::POST, "/upload").expect("matched").operation;
+        assert!(
+            operation
+                .validate_request(&HashMap::new(), &HashMap::new(), &HeaderMap::new(), None, true)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn request_body_without_content_is_still_required() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/items": {
+                    "post": {
+                        "requestBody": {"required": true},
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::POST, "/items").expect("matched").operation;
+        assert!(operation.request_body_required);
+        assert!(operation.request_body_schema.is_none());
+        assert!(operation.request_body_media_types.is_empty());
+        assert!(
+            !operation
+                .validate_request(&HashMap::new(), &HashMap::new(), &HeaderMap::new(), None, false)
+                .is_empty()
+        );
+    }
+
+    // ── responses ──────────────────────────────────────────────────────
+
+    #[test]
+    fn malformed_response_entries_are_skipped() {
+        let parsed = super::parse_responses(
+            &serde_json::json!({"responses": {"200": "not an object"}})
+                .as_object()
+                .cloned()
+                .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn operation_without_responses_yields_an_empty_list() {
+        let parsed = super::parse_responses(&serde_json::Map::new(), "3.1.0").expect("parse");
+        assert!(parsed.is_empty());
+
+        let parsed = super::parse_responses(
+            &serde_json::json!({"responses": "nope"}).as_object().cloned().expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn malformed_content_entries_are_skipped() {
+        let parsed = super::parse_responses(
+            &serde_json::json!({
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": "not an object",
+                            "text/plain": {"schema": {"type": "string"}}
+                        }
+                    }
+                }
+            })
+            .as_object()
+            .cloned()
+            .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+
+        assert_eq!(parsed[0].content.len(), 1, "only the well-formed media type is kept");
+        assert_eq!(parsed[0].content[0].media_type, "text/plain");
+    }
+
+    #[test]
+    fn bare_named_examples_are_accepted() {
+        let parsed = super::parse_responses(
+            &serde_json::json!({
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "examples": {
+                                    "first": {"value": 1},
+                                    "bare": 2
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+            .as_object()
+            .cloned()
+            .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+
+        let entry = &parsed[0].content[0];
+        assert_eq!(entry.named_examples.get("first"), Some(&serde_json::json!(1)));
+        assert_eq!(entry.named_examples.get("bare"), Some(&serde_json::json!(2)));
+        assert_eq!(
+            entry.example,
+            Some(serde_json::json!(2)),
+            "named examples are stored in a sorted map, so `bare` wins over `first`"
+        );
+    }
+
+    #[test]
+    fn explicit_example_wins_over_named_examples() {
+        let parsed = super::parse_responses(
+            &serde_json::json!({
+                "responses": {
+                    "200": {
+                        "content": {
+                            "application/json": {
+                                "example": "explicit",
+                                "examples": {"named": {"value": "from-named"}}
+                            }
+                        }
+                    }
+                }
+            })
+            .as_object()
+            .cloned()
+            .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert_eq!(parsed[0].content[0].example, Some(serde_json::json!("explicit")));
+    }
+
+    #[test]
+    fn response_header_examples_variants_are_all_supported() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "headers": {
+                        "X-Direct": {"example": "a"},
+                        "X-Named": {"examples": {"only": {"value": "b"}}},
+                        "X-Schema": {"schema": {"type": "string"}},
+                        "X-Bare": "not an object",
+                        "X-Empty": {}
+                    }
+                }
+            }
+        }));
+
+        assert_eq!(response.headers.len(), 4, "the malformed header is skipped");
+        assert_eq!(response.headers["X-Direct"].example, Some(serde_json::json!("a")));
+        assert_eq!(response.headers["X-Named"].example, Some(serde_json::json!("b")));
+        assert!(response.headers["X-Schema"].schema.is_some());
+        assert_eq!(response.headers["X-Empty"].example, None);
+        assert_eq!(response.headers["X-Empty"].schema, None);
+    }
+
+    #[test]
+    fn header_values_are_rendered_as_strings() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "headers": {
+                        "X-Int": {"example": 42},
+                        "X-Null": {"example": null},
+                        "X-Bool": {"example": true}
+                    }
+                }
+            }
+        }));
+
+        let rendered = super::generate_response_headers(&response.headers, 1);
+        let map: BTreeMap<&str, &str> =
+            rendered.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(map.get("X-Int"), Some(&"42"));
+        assert_eq!(map.get("X-Null"), Some(&""));
+        assert_eq!(map.get("X-Bool"), Some(&"true"));
+    }
+
+    #[test]
+    fn header_generation_skips_headers_with_no_renderable_value() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {"200": {"headers": {"X-Empty": {}, "X-Ok": {"example": "v"}}}}
+        }));
+
+        let rendered = super::generate_response_headers(&response.headers, 1);
+        assert_eq!(rendered.len(), 1);
+        assert_eq!(rendered[0].0, "X-Ok");
+    }
+
+    #[test]
+    fn schema_generated_headers_are_deterministic_per_name() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "headers": {
+                        "X-A": {"schema": {"type": "string", "minLength": 4, "maxLength": 4}},
+                        "X-B": {"schema": {"type": "string", "minLength": 4, "maxLength": 4}}
+                    }
+                }
+            }
+        }));
+
+        let first = super::generate_response_headers(&response.headers, 7);
+        let second = super::generate_response_headers(&response.headers, 7);
+        assert_eq!(first, second, "the same seed must reproduce header values");
+
+        let map: BTreeMap<&str, &str> =
+            first.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(map.get("X-A").map(|value| value.len()), Some(4));
+        assert_ne!(
+            map.get("X-A"),
+            map.get("X-B"),
+            "each header derives its own seed, so two headers must not collide"
+        );
+    }
+
+    #[test]
+    fn json_schema_prefers_the_json_family() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "content": {
+                        "text/plain": {"schema": {"type": "string", "title": "text"}},
+                        "application/json": {"schema": {"type": "object", "title": "json"}}
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            response.json_schema().and_then(|s| s.get("title")),
+            Some(&serde_json::json!("json"))
+        );
+    }
+
+    #[test]
+    fn json_schema_falls_back_to_the_first_declared_entry() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {
+                "200": {
+                    "content": {
+                        "text/plain": {"schema": {"type": "string", "title": "text"}}
+                    }
+                }
+            }
+        }));
+        assert_eq!(
+            response.json_schema().and_then(|s| s.get("title")),
+            Some(&serde_json::json!("text")),
+            "a non-JSON-only response still exposes its schema"
+        );
+    }
+
+    #[test]
+    fn json_schema_is_none_when_no_entry_declares_one() {
+        let response = response_from_yaml_ish(serde_json::json!({
+            "responses": {"200": {"content": {"text/plain": {}}}}
+        }));
+        assert!(response.json_schema().is_none());
+    }
+
+    // ── mock response generation ───────────────────────────────────────
+
+    #[test]
+    fn bodyless_response_stays_bodyless() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {"/x": {"get": {"responses": {"204": {"description": "no content"}}}}}
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+        assert_eq!(mock.status, 204);
+        assert_eq!(mock.media_type, None);
+        assert_eq!(mock.body, None);
+        assert_eq!(mock.schema, None);
+    }
+
+    #[test]
+    fn default_response_is_selected_when_no_2xx_exists() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "default": {
+                                "description": "fallback",
+                                "content": {"application/json": {"example": {"k": 1}}}
+                            },
+                            "418": {"description": "teapot"}
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+
+        // `default` maps onto HTTP 200 (see `parse_status_code`), which is why it
+        // wins here even though a non-2xx entry is also declared.
+        assert_eq!(mock.status, 200);
+        assert_eq!(mock.body, Some(serde_json::json!({"k": 1})));
+    }
+
+    #[test]
+    fn response_with_no_2xx_and_no_default_uses_the_first_declared() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "418": {
+                                "description": "teapot",
+                                "content": {"application/json": {"example": {"k": 1}}}
+                            },
+                            "500": {"description": "boom"}
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+        assert_eq!(mock.status, 418, "with no 2xx and no default the first entry is used");
+    }
+
+    #[test]
+    fn any_2xx_status_is_preferred_over_default() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "default": {"description": "fallback"},
+                            "202": {"description": "accepted"}
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+        assert_eq!(mock.status, 202);
+    }
+
+    #[test]
+    fn media_type_without_a_schema_produces_no_body() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "200": {"content": {"application/json": {"description": "no schema"}}}
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+        assert_eq!(mock.body, None, "with no schema and no example there is nothing to generate");
+        assert!(mock.schema.is_none());
+    }
+
+    #[test]
+    fn dynamic_mode_without_a_schema_produces_no_body() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {"schema": {"type": "string"}, "example": "static"}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+
+        let dynamic =
+            super::super::negotiate::PreferDirectives { dynamic: true, ..Default::default() };
+        let mock = operation.mock_response(1, &dynamic).expect("mock");
+        assert_ne!(
+            mock.body,
+            Some(serde_json::json!("static")),
+            "dynamic=true bypasses the example"
+        );
+    }
+
+    #[test]
+    fn first_named_example_is_used_when_no_explicit_example_exists() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {
+                                        "schema": {"type": "object"},
+                                        "examples": {"only": {"value": {"from": "named"}}}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let mock = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect("mock");
+        assert_eq!(mock.body, Some(serde_json::json!({"from": "named"})));
+    }
+
+    #[test]
+    fn example_override_is_scoped_to_the_negotiated_media_type() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {"examples": {"j": {"value": {"kind": "json"}}}},
+                                    "text/plain": {"examples": {"t": {"value": "text"}}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+
+        let prefer = super::super::negotiate::PreferDirectives {
+            example: Some("t".to_owned()),
+            media_type: Some("text/plain".to_owned()),
+            ..Default::default()
+        };
+        let mock = operation.mock_response(1, &prefer).expect("mock");
+        assert_eq!(mock.media_type.as_deref(), Some("text/plain"));
+        assert_eq!(mock.body, Some(serde_json::json!("text")));
+
+        // The same example name does not exist on the JSON entry, so asking for
+        // it while negotiating JSON is an error rather than a silent fallback.
+        let mismatch = super::super::negotiate::PreferDirectives {
+            example: Some("t".to_owned()),
+            media_type: Some("application/json".to_owned()),
+            ..Default::default()
+        };
+        let error =
+            operation.mock_response(1, &mismatch).expect_err("example is scoped per media type");
+        assert!(
+            matches!(error, crate::RuntimeError::NotFound(_)),
+            "expected NotFound, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn faker_errors_surface_as_parse_failures() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {
+                    "get": {
+                        "responses": {
+                            "200": {
+                                "content": {
+                                    "application/json": {"schema": {"type": "banana"}}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+
+        let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+        let error = operation
+            .mock_response(1, &super::super::negotiate::PreferDirectives::default())
+            .expect_err("an ungeneratable schema must surface as an error");
+        assert!(matches!(error, crate::RuntimeError::Parse(_)), "got {error:?}");
+    }
+
+    // ── callbacks ──────────────────────────────────────────────────────
+
+    #[test]
+    fn callbacks_are_parsed_from_every_method() {
+        let runtime = build_runtime(serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/subscribe": {
+                    "post": {
+                        "callbacks": {
+                            "onEvent": {
+                                "{$request.body#/callbackUrl}/notify": {
+                                    "post": {
+                                        "requestBody": {
+                                            "content": {
+                                                "application/json": {
+                                                    "schema": {"type": "object", "title": "Payload"}
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                        "responses": {"200": {"description": "ok"}}
+                    }
+                }
+            }
+        }));
+
+        let operation =
+            runtime.match_operation(&Method::POST, "/subscribe").expect("matched").operation;
+        assert_eq!(operation.callbacks.len(), 1);
+        assert_eq!(
+            operation.callbacks[0].callback_url_expression,
+            "{$request.body#/callbackUrl}/notify"
+        );
+        assert_eq!(operation.callbacks[0].method, Method::POST);
+        assert_eq!(
+            operation.callbacks[0].request_body_schema.as_ref().and_then(|s| s.get("title")),
+            Some(&serde_json::json!("Payload"))
+        );
+    }
+
+    #[test]
+    fn malformed_callback_nodes_are_skipped() {
+        let parsed = super::parse_callbacks(
+            &serde_json::json!({
+                "callbacks": {
+                    "a": "not an object",
+                    "b": {"expr": "not an object"},
+                    "c": {"expr": {"get": "not an operation object"}}
+                }
+            })
+            .as_object()
+            .cloned()
+            .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert!(parsed.is_empty());
+
+        assert!(
+            super::parse_callbacks(&serde_json::Map::new(), "3.1.0").expect("parse").is_empty()
+        );
+    }
+
+    #[test]
+    fn callback_without_a_json_request_body_has_no_schema() {
+        let parsed = super::parse_callbacks(
+            &serde_json::json!({
+                "callbacks": {"a": {"expr": {"post": {"requestBody": {"content": {"text/plain": {}}}}}}}
+            })
+            .as_object()
+            .cloned()
+            .expect("obj"),
+            "3.1.0",
+        )
+        .expect("parse");
+        assert_eq!(parsed[0].request_body_schema, None);
+    }
+
+    #[test]
+    fn callback_url_resolves_body_pointers() {
+        let body = serde_json::json!({"callbackUrl": "https://cb.example.com/hook", "port": 8080});
+        assert_eq!(
+            super::resolve_callback_url("{$request.body#/callbackUrl}/done", Some(&body)),
+            Some("https://cb.example.com/hook/done".to_owned())
+        );
+        assert_eq!(
+            super::resolve_callback_url("http://x/{$request.body#/port}", Some(&body)),
+            Some("http://x/8080".to_owned()),
+            "a non-string body value is rendered with its JSON form"
+        );
+    }
+
+    #[test]
+    fn callback_url_keeps_unresolvable_tokens_verbatim() {
+        let body = serde_json::json!({"other": 1});
+        assert_eq!(
+            super::resolve_callback_url("{$request.body#/missing}/x", Some(&body)),
+            Some("{$request.body#/missing}/x".to_owned())
+        );
+        assert_eq!(
+            super::resolve_callback_url("{$request.body#/a}", None),
+            Some("{$request.body#/a}".to_owned())
+        );
+    }
+
+    #[test]
+    fn callback_url_with_an_unclosed_brace_is_none() {
+        assert_eq!(
+            super::resolve_callback_url("{$request.body#/a", Some(&serde_json::json!({}))),
+            None
+        );
+    }
+
+    #[test]
+    fn callback_url_with_no_tokens_returns_the_literal() {
+        assert_eq!(
+            super::resolve_callback_url("https://static.example/hook", None),
+            Some("https://static.example/hook".to_owned())
+        );
+    }
+
+    #[test]
+    fn callback_url_with_an_empty_expression_is_none() {
+        assert_eq!(super::resolve_callback_url("", None), None);
+    }
+
+    #[test]
+    fn callback_url_handles_multiple_tokens() {
+        let body = serde_json::json!({"a": "A", "b": "B"});
+        assert_eq!(
+            super::resolve_callback_url("{$request.body#/a}-{$request.body#/b}", Some(&body)),
+            Some("A-B".to_owned())
+        );
+    }
+
+    // ── property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Recursive strategy for arbitrary JSON values.
+    ///
+    /// `serde_json::Value` does not implement `proptest::Arbitrary`, so the
+    /// generator is assembled from bounded leaf and container shapes.
+    fn any_json() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            any::<bool>().prop_map(serde_json::Value::from),
+            any::<i64>().prop_map(serde_json::Value::from),
+            "[ -~]{0,8}".prop_map(serde_json::Value::from),
+        ];
+        leaf.prop_recursive(3, 12, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(serde_json::Value::Array),
+                prop::collection::hash_map("[a-z]{1,6}", inner, 0..4).prop_map(|members| {
+                    let map: serde_json::Map<String, serde_json::Value> =
+                        members.into_iter().collect();
+                    serde_json::Value::Object(map)
+                }),
+            ]
+        })
+    }
+
+    /// A minimal but valid OpenAPI document with a free-form status code.
+    fn document_with_status(status: u16) -> serde_json::Value {
+        serde_json::json!({
+            "openapi": "3.1.0",
+            "paths": {
+                "/x": {"get": {"responses": {status.to_string(): {"description": "ok"}}}}
+            }
+        })
+    }
+
+    // `rustfmt` cannot parse the `proptest!` DSL, so this block is left verbatim.
+
+    #[rustfmt::skip]
+
+    proptest! {
+        /// Parsing any document never panics and never leaves the runtime in a
+        /// state where `match_operation` disagrees with the router.
+        #[test]
+        fn parsing_any_document_never_panics(document in any_json())
+        {
+            let _ = OpenApiRuntime::from_resolved(document);
+        }
+
+        /// Status-code parsing is total: any declared status round-trips to the
+        /// same numeric code, and anything else degrades to 200.
+        #[test]
+        fn status_codes_round_trip(status in 100u16..600)
+        {
+            let runtime = OpenApiRuntime::from_resolved(document_with_status(status))
+                .expect("document should parse");
+            let operation = runtime.match_operation(&Method::GET, "/x").expect("matched").operation;
+            let prefer = super::super::negotiate::PreferDirectives { code: Some(status), ..Default::default() };
+            let mock = operation.mock_response(1, &prefer).expect("mock");
+            prop_assert_eq!(mock.status, status);
+        }
+
+        /// Parameter coercion is total: whatever the raw text and declared
+        /// type, the coerced value either matches the declared type or falls
+        /// back to a string.
+        #[test]
+        fn parameter_coercion_never_panics(
+            raw in ".{0,12}",
+            type_name in prop::sample::select(vec![
+                serde_json::json!("integer"),
+                serde_json::json!("number"),
+                serde_json::json!("boolean"),
+                serde_json::json!("string"),
+                serde_json::json!(["null", "integer"]),
+            ]),
+        ) {
+            let schema = serde_json::json!({"type": type_name.clone()});
+            let parsed = super::parse_parameter_value(&raw, &schema);
+            // Round-trip through JSON to guarantee the value is representable.
+            let encoded = serde_json::to_string(&parsed).expect("coerced value must serialize");
+            let _ = serde_json::from_str::<serde_json::Value>(&encoded).expect("must re-parse");
+        }
+
+        /// Nullable normalization is total: whatever the declared `type`, the
+        /// result is still valid JSON and keeps the original when `nullable`
+        /// is absent or the version is 3.1.
+        #[test]
+        fn schema_normalization_never_panics(
+            schema in any_json(),
+            is_30 in any::<bool>(),
+        ) {
+            let mut normalized = schema.clone();
+            super::normalize_schema(&mut normalized, is_30);
+            let _ = serde_json::to_string(&normalized).expect("normalized schema must serialize");
+        }
+
+        /// Callback expression resolution is total: any expression either
+        /// yields `None` or a non-empty URL string.
+        #[test]
+        fn callback_url_resolution_never_panics(
+            expression in "[a-zA-Z0-9{}$#/_.-]{0,40}",
+            body in prop::option::of(any_json()),
+        ) {
+            let body = body.unwrap_or(serde_json::json!({"callbackUrl": "https://cb.example.com"}));
+            match super::resolve_callback_url(&expression, Some(&body)) {
+                Some(url) => prop_assert!(!url.is_empty()),
+                None => prop_assert!(
+                    expression.is_empty() || expression.contains('{'),
+                    "an unresolvable expression must retain its token: {:?}",
+                    expression
+                ),
+            }
+        }
+
+        /// `validate_request` is total: whatever the parameter shapes, it either
+        /// reports fully-formed issues or succeeds.
+        #[test]
+        fn request_validation_never_panics(
+            value in any_json(),
+            name in "[a-z]{1,6}",
+        ) {
+            let operation = super::OperationSpec {
+                method: Method::GET,
+                path_template: "/x".to_owned(),
+                operation_id: None,
+                parameters: vec![super::ParameterSpec {
+                    name,
+                    location: super::ParameterIn::Query,
+                    required: true,
+                    schema: value,
+                }],
+                request_body_schema: None,
+                request_body_required: false,
+                request_body_media_types: Vec::new(),
+                responses: Vec::new(),
+                callbacks: Vec::new(),
+            };
+
+            let mut query = HashMap::new();
+            query.insert("a".to_owned(), vec!["1".to_owned()]);
+            let issues = operation.validate_request(
+                &HashMap::new(),
+                &query,
+                &HeaderMap::new(),
+                None,
+                false,
+            );
+            for issue in issues {
+                prop_assert!(!issue.keyword.is_empty());
+            }
+        }
     }
 }
