@@ -4,7 +4,10 @@ pub mod contract;
 pub mod error;
 pub mod faker;
 pub mod ref_resolver;
+pub mod scenario;
 pub mod schema;
+pub mod sidecar;
+pub mod store;
 pub mod validate;
 
 pub use contract::MockMode;
