@@ -1,0 +1,70 @@
+version: 1
+
+operations:
+  createWidget:
+    match: { method: POST, path: /widgets }
+    store:
+      resource: /widgets
+      action: create
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "201": {}
+
+  getWidget:
+    match: { method: GET, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: read, key: "{id}" }
+    responses:
+      "200": {}
+
+  updateWidget:
+    match: { method: PUT, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: update, key: "{id}" }
+    responses:
+      "200": {}
+
+  deleteWidget:
+    match: { method: DELETE, path: "/widgets/{id}" }
+    store: { resource: /widgets, action: delete, key: "{id}" }
+    responses:
+      "204": {}
+
+  listWidgets:
+    match: { method: GET, path: /widgets }
+    store: { resource: /widgets, action: list }
+    responses:
+      "200": {}
+
+  getGadget:
+    match: { method: GET, path: "/gadgets/{id}" }
+    store: { resource: /gadgets, action: read, key: "{id}" }
+    responses:
+      "200": {}
+
+scenarios:
+  - name: catalogue
+    initialState: browsing
+    seed:
+      - resource: /widgets
+        items:
+          - { id: seeded-1, name: Preloaded Widget }
+    states:
+      browsing:
+        createWidget: { to: browsing }
+        getWidget: {}
+        updateWidget: {}
+        deleteWidget: {}
+        listWidgets: {}
+
+  # Exercises a state-specific error response: an error is a transition into a
+  # state that declares one, not a separate mechanism.
+  - name: fragile
+    initialState: healthy
+    seed:
+      - resource: /gadgets
+        items:
+          - { id: fragile-1, name: Fragile Gadget }
+    states:
+      healthy:
+        getGadget: { to: failing, responses: { "503": { body: { error: unavailable } } } }
+      failing:
+        getGadget: {}

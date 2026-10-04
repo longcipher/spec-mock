@@ -1,6 +1,9 @@
 //! Error and validation issue models.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 /// Content-Type for RFC 7807 responses.
@@ -47,6 +50,14 @@ pub struct ProblemDetails {
     /// Detailed validation errors.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub errors: Vec<ValidationIssue>,
+    /// RFC 7807 extension members.
+    ///
+    /// Failures that are not JSON Schema violations -- a scenario refusing an
+    /// operation, a store missing a resource -- carry their context here rather
+    /// than being forced into `errors`, where every field would describe a
+    /// schema keyword and the pointers would point at nothing.
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub extensions: BTreeMap<String, Value>,
 }
 
 impl ProblemDetails {
@@ -60,6 +71,7 @@ impl ProblemDetails {
             detail: "Request validation failed".to_owned(),
             instance: None,
             errors: issues,
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -73,6 +85,28 @@ impl ProblemDetails {
             detail: detail.to_owned(),
             instance: None,
             errors: Vec::new(),
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// Create a response for a failure that is not a schema violation.
+    ///
+    /// `errors` stays empty: an operation refused by a state machine has no
+    /// instance pointer and no schema pointer to report.
+    #[must_use]
+    pub fn stateful_error(
+        status: u16,
+        detail: impl Into<String>,
+        extensions: impl IntoIterator<Item = (String, Value)>,
+    ) -> Self {
+        Self {
+            problem_type: "about:blank".to_owned(),
+            title: title_for_status(status).to_owned(),
+            status,
+            detail: detail.into(),
+            instance: None,
+            errors: Vec::new(),
+            extensions: extensions.into_iter().collect(),
         }
     }
 
@@ -86,6 +120,7 @@ impl ProblemDetails {
             detail: detail.to_owned(),
             instance: None,
             errors: Vec::new(),
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -99,6 +134,7 @@ impl ProblemDetails {
             detail: detail.to_owned(),
             instance: None,
             errors: Vec::new(),
+            extensions: BTreeMap::new(),
         }
     }
 
@@ -112,6 +148,7 @@ impl ProblemDetails {
             detail: detail.to_owned(),
             instance: None,
             errors: Vec::new(),
+            extensions: BTreeMap::new(),
         }
     }
 }
@@ -154,6 +191,50 @@ pub enum SpecMockCoreError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stateful_error_carries_extension_members_alongside_the_standard_fields() {
+        let problem = ProblemDetails::stateful_error(
+            409,
+            "operation 'pay' is not legal in state 'cart'",
+            [
+                ("scenario".to_owned(), serde_json::json!("checkout")),
+                ("state".to_owned(), serde_json::json!("cart")),
+            ],
+        );
+
+        let encoded = serde_json::to_value(&problem).expect("problem should serialize");
+        assert_eq!(encoded["status"], 409);
+        assert_eq!(encoded["scenario"], "checkout");
+        assert_eq!(encoded["state"], "cart");
+        assert!(
+            encoded.get("errors").is_none(),
+            "a non-schema failure must not carry an empty errors array"
+        );
+    }
+
+    #[test]
+    fn extension_members_are_omitted_when_empty() {
+        let encoded =
+            serde_json::to_value(ProblemDetails::not_found("nothing here")).expect("serialize");
+        assert!(
+            !encoded.as_object().is_some_and(|object| object.keys().any(|key| key == "extensions")),
+            "an empty extension map must not appear on the wire"
+        );
+    }
+
+    #[test]
+    fn a_validation_error_reports_no_extensions() {
+        let issue = ValidationIssue {
+            instance_pointer: "/id".to_owned(),
+            schema_pointer: "/minimum".to_owned(),
+            keyword: "minimum".to_owned(),
+            message: "too small".to_owned(),
+        };
+        let encoded = serde_json::to_value(ProblemDetails::validation_error(400, vec![issue]))
+            .expect("serialize");
+        assert_eq!(encoded["errors"][0]["instance_pointer"], "/id");
+    }
 
     #[test]
     fn validation_error_serialization_roundtrip() {

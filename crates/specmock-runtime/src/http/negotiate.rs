@@ -13,6 +13,14 @@ pub struct PreferDirectives {
     pub media_type: Option<String>,
     /// Whether dynamic faker mode was requested (`Prefer: dynamic=true`).
     pub dynamic: bool,
+    /// Scenario to run (`Prefer: scenario=checkout`).
+    ///
+    /// Absent, the first scenario the sidecar declares is used.
+    pub scenario: Option<String>,
+    /// Session key naming an isolated scenario instance (`Prefer: session=t1`).
+    ///
+    /// Absent, one default instance serves every request.
+    pub session: Option<String>,
 }
 
 impl PreferDirectives {
@@ -22,6 +30,8 @@ impl PreferDirectives {
     /// - `Prefer: code=<status>` — select a response by status code
     /// - `Prefer: example=<name>` — select a named example
     /// - `Prefer: dynamic=true`  — force faker-generated dynamic data
+    /// - `Prefer: scenario=<name>` — run the named scenario
+    /// - `Prefer: session=<key>`  — address one isolated scenario instance
     /// - `Accept` header         — preferred response media type
     pub fn from_headers(headers: &HeaderMap) -> Self {
         let mut directives = Self::default();
@@ -53,6 +63,12 @@ fn parse_prefer_value(text: &str, directives: &mut PreferDirectives) {
             match key {
                 "code" => {
                     directives.code = value.parse::<u16>().ok();
+                }
+                "scenario" if !value.is_empty() => {
+                    directives.scenario = Some(value.to_owned());
+                }
+                "session" if !value.is_empty() => {
+                    directives.session = Some(value.to_owned());
                 }
                 "example" if !value.is_empty() => {
                     directives.example = Some(value.to_owned());

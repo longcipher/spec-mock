@@ -5,6 +5,7 @@ pub mod negotiate;
 pub mod openapi;
 pub mod proxy;
 pub mod router;
+pub mod scenarios;
 pub mod ws_handler;
 
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
@@ -20,10 +21,11 @@ use axum::{
 };
 use negotiate::PreferDirectives;
 use openapi::{MatchedOperation, OpenApiRuntime};
+use scenarios::ScenarioRuntime;
 use serde_json::Value;
 use specmock_core::{
     MockMode, PROBLEM_JSON_CONTENT_TYPE, ProblemDetails, ValidationIssue,
-    faker::generate_json_value,
+    faker::generate_json_value, ref_resolver::RefResolver,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -42,6 +44,10 @@ pub struct HttpRuntime {
     ws_channel_paths: HashMap<String, String>,
     max_body_size: usize,
     client: hpx::Client,
+    /// Stateful behaviour, absent unless a sidecar was supplied.
+    scenarios: Option<ScenarioRuntime>,
+    /// Bearer token guarding the control endpoints.
+    control_token: Option<String>,
 }
 
 impl std::fmt::Debug for HttpRuntime {
@@ -56,11 +62,19 @@ impl std::fmt::Debug for HttpRuntime {
             .field("ws_path", &self.ws_path)
             .field("ws_channel_paths", &self.ws_channel_paths)
             .field("max_body_size", &self.max_body_size)
+            .field("scenarios", &self.scenarios)
+            .field("control_token", &self.control_token.as_ref().map(|_| "[redacted]"))
             .finish_non_exhaustive()
     }
 }
 
 impl HttpRuntime {
+    /// The scenario runtime, present only when a sidecar was supplied.
+    #[must_use]
+    pub fn scenarios(&self) -> Option<&ScenarioRuntime> {
+        self.scenarios.as_ref()
+    }
+
     /// Resolve the pinned channel name for a WebSocket request path.
     ///
     /// Returns `Some(channel_name)` when the path matches a per-channel
@@ -117,6 +131,22 @@ impl HttpRuntime {
             }
         }
 
+        if config.mode == MockMode::Proxy && config.scenarios_spec.is_some() {
+            // The upstream holds the real state. A mock store layered in front of
+            // it would answer from invented data while the client believes it is
+            // talking to something authoritative.
+            return Err(RuntimeError::Config(
+                "--scenarios cannot be combined with --mode proxy: the upstream holds the real \
+                 state. Drop one of the two."
+                    .to_owned(),
+            ));
+        }
+
+        let scenarios =
+            config.scenarios_spec.as_deref().map(load_scenarios).transpose()?.map(|resolved| {
+                ScenarioRuntime::new(resolved, config.max_sessions, config.max_store_entries)
+            });
+
         Ok(Self {
             openapi,
             asyncapi,
@@ -127,8 +157,31 @@ impl HttpRuntime {
             ws_channel_paths,
             max_body_size: config.max_body_size,
             client: hpx::Client::new(),
+            scenarios,
+            control_token: config.control_token.clone(),
         })
     }
+}
+
+/// Load and validate a scenario sidecar.
+///
+/// The sidecar goes through the same [`RefResolver`] as a specification, so
+/// `$ref` works inside it and into the OpenAPI document, with the same depth
+/// limit and allowed-root sandboxing. One resolver, two documents.
+fn load_scenarios(
+    path: &std::path::Path,
+) -> Result<specmock_core::sidecar::ValidatedSidecar, RuntimeError> {
+    let base_dir = path.parent().unwrap_or(path).to_path_buf();
+    let mut resolver = RefResolver::new(base_dir);
+    let resolved =
+        resolver.resolve(path).map_err(|error| RuntimeError::Parse(error.to_string()))?;
+    let validated = specmock_core::sidecar::parse(&resolved).map_err(|error| {
+        RuntimeError::Config(format!("invalid scenario sidecar '{}': {error}", path.display()))
+    })?;
+    for warning in validated.warnings() {
+        tracing::warn!("{warning}");
+    }
+    Ok(validated)
 }
 
 /// Spawn HTTP/WS server.
@@ -267,6 +320,49 @@ async fn http_fallback_handler(
         &matched.operation.path_template,
         &matched.path_params,
     );
+
+    // Stateful resolution runs last, once the request is known to be valid.
+    // Validation gating the transition is the whole point: a client bug must not
+    // leave the mock in a state that poisons every later assertion.
+    //
+    // `dynamic=true` bypasses the store along with `code=` above. Both are
+    // read-only escape hatches, and letting either behave differently depending
+    // on hidden server state would give one header two meanings.
+    if let Some(scenario_runtime) = &runtime.scenarios {
+        let resolution = scenario_runtime.resolve(
+            prefer.scenario.as_deref(),
+            prefer.session.as_deref(),
+            method.as_str(),
+            &matched.operation.path_template,
+            &matched.path_params,
+            request_body_json.as_ref(),
+            mock_response.body.as_ref().unwrap_or(&Value::Null),
+            prefer.code.is_some() || prefer.dynamic,
+            true,
+        );
+
+        match resolution {
+            scenarios::Resolution::Ungoverned => {}
+            scenarios::Resolution::Body(body) => mock_response.body = Some(body),
+            scenarios::Resolution::Empty => {
+                mock_response.body = None;
+                mock_response.status = 204;
+            }
+            scenarios::Resolution::Forced { status, body } => {
+                mock_response.status = status;
+                if body.is_some() {
+                    mock_response.body = body;
+                }
+            }
+            scenarios::Resolution::Failed(failure) => {
+                return problem_response(ProblemDetails::stateful_error(
+                    failure.status(),
+                    failure.detail(),
+                    failure.extensions(),
+                ));
+            }
+        }
+    }
 
     let response = build_mock_response(&mock_response);
 

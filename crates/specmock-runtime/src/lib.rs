@@ -24,6 +24,16 @@ const DEFAULT_WS_PATH: &str = "/ws";
 /// Default deterministic seed.
 const DEFAULT_SEED: u64 = 42;
 
+/// Default cap on live scenario instances.
+///
+/// Generous enough that ordinary use never reaches it. It exists to bound a
+/// client that sends a fresh `session=` key on every request, which would
+/// otherwise create an unbounded number of instances.
+pub const DEFAULT_MAX_SESSIONS: usize = 256;
+
+/// Default cap on stored resources per scenario instance.
+pub const DEFAULT_MAX_STORE_ENTRIES: usize = 1024;
+
 const FOLD_HASH_MULTIPLIER: u64 = 131;
 
 pub fn deterministic_hash(seed: u64, input: &str) -> u64 {
@@ -57,6 +67,17 @@ pub struct ServerConfig {
     pub max_body_size: usize,
     /// Allow private/link-local/loopback upstream URLs in proxy mode.
     pub allow_private_upstream: bool,
+    /// Scenario sidecar declaring stateful behaviour.
+    ///
+    /// Resolved alongside the OpenAPI document rather than inside it, so a spec
+    /// owned by someone else can be mocked without being forked.
+    pub scenarios_spec: Option<PathBuf>,
+    /// Maximum live scenario instances across all sessions.
+    pub max_sessions: usize,
+    /// Maximum stored resources per scenario instance.
+    pub max_store_entries: usize,
+    /// Bearer token required by the control endpoints. `None` disables them.
+    pub control_token: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -73,6 +94,10 @@ impl Default for ServerConfig {
             ws_path: DEFAULT_WS_PATH.to_owned(),
             max_body_size: DEFAULT_MAX_BODY_SIZE,
             allow_private_upstream: false,
+            scenarios_spec: None,
+            max_sessions: DEFAULT_MAX_SESSIONS,
+            max_store_entries: DEFAULT_MAX_STORE_ENTRIES,
+            control_token: None,
         }
     }
 }
