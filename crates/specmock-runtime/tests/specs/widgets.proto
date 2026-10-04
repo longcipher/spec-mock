@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package widgets;
+
+// Exercises scenario-driven gRPC mocking. The catalogue addresses methods as
+// `unary /widgets.Widgets/Create`, matching the shape the HTTP and WebSocket
+// adapters use.
+service Widgets {
+  // Stores the generated reply under the identifier carried in the request, so a
+  // later Get returns exactly what the client was shown.
+  rpc Create(CreateRequest) returns (Widget);
+
+  // Returns the stored reply for the requested identifier.
+  rpc Get(GetRequest) returns (Widget);
+
+  // Declares a 13 in one state, which is how fault injection is expressed as a
+  // transition rather than a separate mechanism.
+  rpc Unstable(UnstableRequest) returns (Widget);
+}
+
+message CreateRequest {
+  string id = 1;
+  string name = 2;
+}
+
+message GetRequest {
+  string id = 1;
+}
+
+message UnstableRequest {
+  string id = 1;
+}
+
+message Widget {
+  string id = 1;
+  string name = 2;
+}

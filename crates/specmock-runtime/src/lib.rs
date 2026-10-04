@@ -286,6 +286,13 @@ pub enum RuntimeError {
 }
 
 /// Start protocol runtimes.
+/// Load the scenario runtime a server will share across protocols.
+pub(crate) fn load_scenario_runtime(
+    config: &ServerConfig,
+) -> Result<Option<Arc<http::scenarios::ScenarioRuntime>>, RuntimeError> {
+    http::load_scenarios(config)
+}
+
 pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> {
     config.validate()?;
 
@@ -300,11 +307,12 @@ pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> 
     let http_shutdown = Arc::new(tokio::sync::Notify::new());
     let grpc_shutdown = Arc::new(tokio::sync::Notify::new());
 
-    let http_runtime = http::HttpRuntime::from_config(&config).await?;
-    // Shared with the server task rather than copied. `scc`'s `Clone` snapshots
-    // the current entries into a new map, so a copy would be permanently
-    // disconnected from the sessions the handler is actually serving.
-    let scenarios = http_runtime.scenarios_handle();
+    // One sidecar load, one set of live sessions, shared by every protocol in the
+    // process. `scc`'s `Clone` snapshots, so a per-protocol load would be a
+    // disconnected copy that never saw the other's requests.
+    let scenarios = load_scenario_runtime(&config)?;
+
+    let http_runtime = http::HttpRuntime::from_config_with(&config, scenarios.clone()).await?;
     let (http_addr, http_task) =
         http::spawn_http_server(http_runtime, config.http_addr, Arc::clone(&http_shutdown)).await?;
 
@@ -312,7 +320,7 @@ pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> 
     let mut grpc_addr = None;
 
     if config.proto_spec.is_some() {
-        let grpc_runtime = grpc::GrpcRuntime::from_config(&config).await?;
+        let grpc_runtime = grpc::GrpcRuntime::from_config_with(&config, scenarios.clone()).await?;
         let (bound_grpc_addr, grpc_task) =
             grpc::spawn_grpc_server(grpc_runtime, config.grpc_addr, Arc::clone(&grpc_shutdown))
                 .await?;

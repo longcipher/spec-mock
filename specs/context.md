@@ -52,7 +52,7 @@ Additional tooling:
 - **Integration Tests:** `crates/specmock-runtime/tests/{http_openapi,ws_asyncapi,grpc_protobuf,prism_comparison}.rs`
 - **SDK Tests:** `crates/specmock-sdk/tests/{sdk_embed,sdk_process}.rs`
 - **Test Harness:** `crates/specmock-runtime/tests/harness/{mod,fuzzer,comparator,prism,request}.rs`
-- **Total:** 843 passing tests, 11 ignored (integration tests requiring Prism). Counted from
+- **Total:** 858 passing tests, 11 ignored (integration tests requiring Prism). Counted from
   `cargo test --all-features` on 2026-10-05; recompute rather than trusting this line, as it
   previously sat at a stale 223.
 

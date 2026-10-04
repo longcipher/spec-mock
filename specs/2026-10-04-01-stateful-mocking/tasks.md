@@ -3,7 +3,7 @@
 | Metadata | Details |
 | :--- | :--- |
 | **Design Doc** | specs/2026-10-04-01-stateful-mocking/design.md |
-| **Status** | Shipped for HTTP; WebSocket and gRPC deferred by design |
+| **Status** | Shipped across HTTP, WebSocket, and gRPC |
 | **Glossary** | GLOSSARY.md |
 | **ADRs** | `docs/adr/0001`, `0002`, `0003` |
 

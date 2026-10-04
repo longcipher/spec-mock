@@ -31,11 +31,24 @@ type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, tonic::Status>;
 pub struct GrpcRuntime {
     methods: Arc<HashMap<String, MethodDescriptor>>,
     seed: u64,
+    /// Stateful behaviour, absent unless a sidecar was supplied.
+    scenarios: Option<Arc<crate::http::scenarios::ScenarioRuntime>>,
 }
 
 impl GrpcRuntime {
     /// Build runtime from config.
     pub async fn from_config(config: &crate::ServerConfig) -> Result<Self, RuntimeError> {
+        Self::from_config_with(config, None).await
+    }
+
+    /// Build runtime from config, sharing the scenario runtime with HTTP.
+    ///
+    /// Sharing matters: `scc`'s `Clone` snapshots, so a second load would be a
+    /// disconnected copy with its own empty set of sessions.
+    pub async fn from_config_with(
+        config: &crate::ServerConfig,
+        scenarios: Option<Arc<crate::http::scenarios::ScenarioRuntime>>,
+    ) -> Result<Self, RuntimeError> {
         let proto_spec = config.proto_spec.as_deref().ok_or_else(|| {
             RuntimeError::Config("proto_spec must be set for gRPC runtime".to_owned())
         })?;
@@ -54,7 +67,7 @@ impl GrpcRuntime {
             }
         }
 
-        Ok(Self { methods: Arc::new(methods), seed: config.seed })
+        Ok(Self { methods: Arc::new(methods), seed: config.seed, scenarios })
     }
 }
 
@@ -69,6 +82,7 @@ impl GrpcRuntime {
 struct DynamicGrpcService {
     methods: Arc<HashMap<String, MethodDescriptor>>,
     seed: u64,
+    scenarios: Option<Arc<crate::http::scenarios::ScenarioRuntime>>,
 }
 
 impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService {
@@ -84,6 +98,7 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
     fn call(&mut self, request: http::Request<hyper::body::Incoming>) -> Self::Future {
         let methods = Arc::clone(&self.methods);
         let seed = self.seed;
+        let scenarios = self.scenarios.clone();
 
         Box::pin(async move {
             let (parts, body) = request.into_parts();
@@ -147,20 +162,24 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
             };
 
             // --- decode protobuf request ---
-            if let Err(error) = DynamicMessage::decode(method.input(), request_payload.as_slice()) {
-                return Ok(grpc_error_response(
-                    3,
-                    "protobuf request decode failed",
-                    Some(json!({
-                        "errors": [{
-                            "instance_pointer": "/body",
-                            "schema_pointer": "#",
-                            "keyword": "protobuf",
-                            "message": error.to_string()
-                        }]
-                    })),
-                ));
-            }
+            let decoded_request =
+                match DynamicMessage::decode(method.input(), request_payload.as_slice()) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        return Ok(grpc_error_response(
+                            3,
+                            "protobuf request decode failed",
+                            Some(json!({
+                                "errors": [{
+                                    "instance_pointer": "/body",
+                                    "schema_pointer": "#",
+                                    "keyword": "protobuf",
+                                    "message": error.to_string()
+                                }]
+                            })),
+                        ));
+                    }
+                };
 
             let response_seed = crate::deterministic_hash(seed, &path);
 
@@ -189,6 +208,66 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
                 }
             };
 
+            // Scenario directives travel as lowercase gRPC metadata, so the names the other
+            // adapters use carry over unchanged.
+            let directives = grpc_directives(&parts.headers);
+            // A scenario may answer from its store instead of the faker.
+            //
+            // The store holds response-shaped messages: a gRPC request and its
+            // response are distinct protobuf types, so handing back the request
+            // would return bytes of the wrong message.
+            let response_message = match scenarios.as_ref().map(|scenarios| {
+                let request_json =
+                    serde_json::to_value(&decoded_request).unwrap_or(serde_json::Value::Null);
+                let response_json =
+                    serde_json::to_value(&response_message).unwrap_or(serde_json::Value::Null);
+                scenarios.resolve_grpc(
+                    directives.scenario.as_deref(),
+                    directives.session.as_deref(),
+                    &path,
+                    &request_json,
+                    &response_json,
+                )
+            }) {
+                Some(crate::http::scenarios::Resolution::Failed(failure)) => {
+                    return Ok(grpc_error_response(
+                        grpc_code_for(failure.status()),
+                        &failure.detail(),
+                        Some(failure_json(&failure)),
+                    ));
+                }
+                Some(
+                    crate::http::scenarios::Resolution::Body(value) |
+                    crate::http::scenarios::Resolution::Forced { body: Some(value), .. },
+                ) => {
+                    let encoded_value = value.to_string();
+                    match DynamicMessage::deserialize(
+                        method.output(),
+                        &mut serde_json::de::Deserializer::from_str(&encoded_value),
+                    ) {
+                        Ok(message) => message,
+                        Err(error) => {
+                            return Ok(grpc_error_response(
+                                13,
+                                &format!("failed to build stored response message: {error}"),
+                                None,
+                            ));
+                        }
+                    }
+                }
+                // A response declared with a status and no body means "fail with
+                // this code". Over gRPC the declared key *is* the gRPC status
+                // code, so it passes through rather than being mapped from HTTP.
+                Some(crate::http::scenarios::Resolution::Forced { status, .. }) => {
+                    return Ok(grpc_error_response(
+                        i32::from(status),
+                        &format!("scenario declared gRPC status {status}"),
+                        None,
+                    ));
+                }
+                _ => response_message,
+            };
+
             let encoded = response_message.encode_to_vec();
             let framed = encode_grpc_unary_frame(&encoded);
 
@@ -200,6 +279,66 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
 // ---------------------------------------------------------------------------
 // HTTP/2 response helpers (proper gRPC trailers)
 // ---------------------------------------------------------------------------
+
+/// Scenario directives extracted from gRPC request metadata.
+#[derive(Debug, Default)]
+struct GrpcDirectives {
+    scenario: Option<String>,
+    session: Option<String>,
+}
+
+/// Read `scenario` and `session` from lowercase gRPC metadata.
+fn grpc_directives(headers: &http::HeaderMap) -> GrpcDirectives {
+    let mut directives = GrpcDirectives::default();
+    for (name, value) in headers.iter() {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match name.as_str() {
+            "scenario" => directives.scenario = Some(text.to_owned()),
+            "session" => directives.session = Some(text.to_owned()),
+            _ => {}
+        }
+    }
+    directives
+}
+
+/// Map an HTTP-shaped scenario failure onto a gRPC status code.
+///
+/// The state-machine meanings carry over directly: a conflict with the current
+/// state is `FAILED_PRECONDITION`, a missing resource is `NOT_FOUND`, and a
+/// store that is full is an internal condition rather than the client's fault.
+fn grpc_code_for(status: u16) -> i32 {
+    match status {
+        404 => 5, // NOT_FOUND
+        409 => 9, // FAILED_PRECONDITION
+        429 => 8, // RESOURCE_EXHAUSTED
+        401 => 7, // PERMISSION_DENIED
+        _ => 13,  // INTERNAL
+    }
+}
+
+/// Render a stateful failure as the structured detail payload gRPC clients read.
+fn failure_json(failure: &crate::http::scenarios::StatefulFailure) -> serde_json::Value {
+    let mut payload = json!({
+        "errors": [{
+            "instance_pointer": "/",
+            "schema_pointer": "#",
+            "keyword": "scenario",
+            "message": failure.detail(),
+        }]
+    });
+    if let Some(extensions) = payload.as_object_mut() {
+        for (name, value) in failure.extensions() {
+            extensions.insert(name, value);
+        }
+    }
+    payload
+}
 
 /// Number of mock messages to generate for server-streaming methods.
 const STREAMING_COUNT: u64 = 3;
@@ -296,7 +435,11 @@ pub async fn spawn_grpc_server(
     let listener = TcpListener::bind(bind_addr).await?;
     let bound = listener.local_addr()?;
 
-    let service = DynamicGrpcService { methods: runtime.methods.clone(), seed: runtime.seed };
+    let service = DynamicGrpcService {
+        methods: runtime.methods.clone(),
+        seed: runtime.seed,
+        scenarios: runtime.scenarios.clone(),
+    };
 
     let task = tokio::spawn(async move {
         let builder =

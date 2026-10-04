@@ -109,6 +109,14 @@ impl HttpRuntime {
 
     /// Build from global server config.
     pub async fn from_config(config: &crate::ServerConfig) -> Result<Self, RuntimeError> {
+        Self::from_config_with(config, None).await
+    }
+
+    /// Build from config, reusing an already-loaded scenario runtime.
+    pub async fn from_config_with(
+        config: &crate::ServerConfig,
+        scenarios: Option<Arc<ScenarioRuntime>>,
+    ) -> Result<Self, RuntimeError> {
         let openapi = config.openapi_spec.as_deref().map(OpenApiRuntime::from_path).transpose()?;
         let asyncapi =
             config.asyncapi_spec.as_deref().map(AsyncApiRuntime::from_path).transpose()?;
@@ -166,14 +174,10 @@ impl HttpRuntime {
             ));
         }
 
-        let scenarios: Option<Arc<ScenarioRuntime>> =
-            config.scenarios_spec.as_deref().map(load_scenarios).transpose()?.map(|resolved| {
-                Arc::new(ScenarioRuntime::new(
-                    resolved,
-                    config.max_sessions,
-                    config.max_store_entries,
-                ))
-            });
+        let scenarios = match scenarios {
+            Some(shared) => Some(shared),
+            None => load_scenarios(config)?,
+        };
 
         Ok(Self {
             openapi,
@@ -192,14 +196,18 @@ impl HttpRuntime {
     }
 }
 
-/// Load and validate a scenario sidecar.
+/// Load the scenario sidecar, if one is configured.
 ///
 /// The sidecar goes through the same [`RefResolver`] as a specification, so
 /// `$ref` works inside it and into the OpenAPI document, with the same depth
 /// limit and allowed-root sandboxing. One resolver, two documents.
-fn load_scenarios(
-    path: &std::path::Path,
-) -> Result<specmock_core::sidecar::ValidatedSidecar, RuntimeError> {
+pub(crate) fn load_scenarios(
+    config: &crate::ServerConfig,
+) -> Result<Option<Arc<ScenarioRuntime>>, RuntimeError> {
+    let Some(path) = config.scenarios_spec.as_deref() else {
+        return Ok(None);
+    };
+
     let base_dir = path.parent().unwrap_or(path).to_path_buf();
     let mut resolver = RefResolver::new(base_dir);
     let resolved =
@@ -210,7 +218,12 @@ fn load_scenarios(
     for warning in validated.warnings() {
         tracing::warn!("{warning}");
     }
-    Ok(validated)
+
+    Ok(Some(Arc::new(ScenarioRuntime::new(
+        validated,
+        config.max_sessions,
+        config.max_store_entries,
+    ))))
 }
 
 /// Spawn HTTP/WS server.

@@ -81,15 +81,6 @@ pub enum SidecarError {
         /// The undeclared initial state.
         initial: String,
     },
-    /// An operation declares no store interaction and no response override.
-    ///
-    /// Not fatal on its own, but almost always a mistake, so it is surfaced
-    /// rather than ignored.
-    #[error("operation '{operation}' declares neither a store interaction nor a response")]
-    InertOperation {
-        /// The operation in question.
-        operation: String,
-    },
     /// A keyed action declares neither a path parameter nor a message field.
     ///
     /// `key` reads a path parameter, which suits HTTP. `keyFrom` reads a field
@@ -417,10 +408,9 @@ fn validate(sidecar: &Sidecar) -> Result<(), SidecarError> {
 }
 
 fn validate_operation(name: &str, entry: &OperationEntry) -> Result<(), SidecarError> {
+    // An operation with no store interaction is legitimate: a gRPC method can be
+    // a pure state transition whose per-state responses carry the behaviour.
     let Some(store) = &entry.store else {
-        if entry.responses.is_empty() {
-            return Err(SidecarError::InertOperation { operation: name.to_owned() });
-        }
         return Ok(());
     };
 
@@ -676,16 +666,6 @@ mod tests {
         value["operations"]["readUser"]["store"] =
             json!({ "resource": "/users", "action": "list" });
         assert!(parse(&value).is_ok(), "listing addresses a namespace, not a resource");
-    }
-
-    #[test]
-    fn an_inert_operation_is_rejected() {
-        let mut value = minimal();
-        value["operations"]["noop"] = json!({
-            "match": { "method": "GET", "path": "/nothing" }
-        });
-        value["scenarios"][0]["states"]["anonymous"]["noop"] = json!({});
-        assert_eq!(err(&value), SidecarError::InertOperation { operation: "noop".to_owned() });
     }
 
     #[test]

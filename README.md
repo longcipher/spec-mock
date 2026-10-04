@@ -43,6 +43,8 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 | Content negotiation (406)            |     ✅     |   ❌   |
 | Configurable WebSocket path          |     ✅     |   ❌   |
 | Stateful mocking (scenarios, store)  |     ✅     |   ❌   |
+| Stateful WebSocket channels          |     ✅     |   ❌   |
+| Stateful gRPC methods                |     ✅     |   ❌   |
 | Create-then-read-back resource CRUD  |     ✅     |   ❌   |
 | Scenario failure injection           |     ✅     |   ❌   |
 
@@ -462,12 +464,37 @@ server.reset_scenarios();               // state and store, together
 let (scenario, state) = server.scenario_state("").unwrap();
 ```
 
+### WebSocket and gRPC
+
+The same sidecar drives all three protocols; only the addressing differs.
+
+| Protocol | Operation key | Scenario and session | Identifier source |
+| --- | --- | --- | --- |
+| HTTP | `post /widgets` | `Prefer:` headers | path parameter (`key`) |
+| WebSocket | `channel widgets.created` | `?scenario=&session=` on the handshake | message field (`keyFrom`) |
+| gRPC | `unary /widgets.Widgets/Create` | lowercase metadata | message field (`keyFrom`) |
+
+A WebSocket connection is its own session by default and is released when it
+closes; `?session=` opts into sharing. Over gRPC, a `create` stores the
+*generated reply* rather than the request, because a gRPC request and its
+response are distinct protobuf types — storing the request would hand the client
+bytes of the wrong message. The stored message's identifier is aligned with the
+key, so reading back by the identifier the client was just given succeeds.
+
+Over gRPC a `responses` key is a gRPC status code, not an HTTP status:
+
+```yaml
+    states:
+      steady:
+        unstableWidget: { to: broken }
+      broken:
+        unstableWidget: { responses: { "13": {} } }   # INTERNAL
+```
+
 ### Not supported
 
 - Scenarios in proxy mode. The upstream holds the real state; startup rejects the
   combination and names both settings.
-- WebSocket and gRPC scenarios. The core types are protocol-agnostic, but only
-  HTTP is wired up.
 - Filtering or pagination on `list`.
 - State surviving a restart.
 - Session expiry. A TTL would reintroduce wall-clock dependence into a tool whose

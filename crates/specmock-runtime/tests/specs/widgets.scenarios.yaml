@@ -1,0 +1,53 @@
+# Scenario sidecar for `widgets.proto`.
+#
+# A gRPC method is addressed as `unary /package.Service/Method`, the same
+# catalogue shape the HTTP (`post /widgets`) and WebSocket (`channel chat.send`)
+# adapters use.
+#
+# Unlike HTTP, a gRPC request and its response are distinct protobuf types. A
+# `create` therefore stores the *response* -- what the client will see -- keyed
+# by an identifier read from the request. Storing the request and handing it
+# back as the response would return bytes of the wrong message.
+#
+# Scenario and session travel as lowercase gRPC metadata.
+
+version: 1
+
+operations:
+  createWidget:
+    match: { method: unary, path: /widgets.Widgets/Create }
+    store:
+      resource: /widgets
+      action: create
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "200": {}
+
+  getWidget:
+    match: { method: unary, path: /widgets.Widgets/Get }
+    store:
+      resource: /widgets
+      action: read
+      # No identifier appears in a method path, so the request names it.
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "200": {}
+
+  # A pure state transition with no store behind it: the behaviour is entirely
+  # in the per-state responses, which is what `broken` below demonstrates.
+  unstableWidget:
+    match: { method: unary, path: /widgets.Widgets/Unstable }
+
+scenarios:
+  - name: widgets
+    initialState: steady
+    states:
+      steady:
+        createWidget: {}
+        getWidget: {}
+        # Drive this method once and the flow lands in a state that declares an
+        # error response.
+        unstableWidget: { to: broken }
+
+      broken:
+        unstableWidget: { responses: { "13": {} } }

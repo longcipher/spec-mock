@@ -33,7 +33,7 @@ hyper-util = { workspace = true, features = [
     "service",
 ] }
 prost = { workspace = true }
-prost-reflect = { workspace = true }
+prost-reflect = { workspace = true, features = ["serde"] }
 protox = { workspace = true }
 rand.workspace = true
 rand_chacha.workspace = true

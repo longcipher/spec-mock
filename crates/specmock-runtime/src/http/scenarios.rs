@@ -429,6 +429,44 @@ impl ScenarioRuntime {
         )
     }
 
+    /// Resolve a unary gRPC call.
+    ///
+    /// A method is addressed as `unary /package.Service/Method`, matching the
+    /// catalogue shape the other adapters use.
+    ///
+    /// The store holds *response*-shaped messages here, not request-shaped ones.
+    /// A gRPC request and its response are distinct protobuf types, so storing
+    /// the request and handing it back as the response would be a type confusion.
+    /// Storing the response the client will see is what makes "create, then get"
+    /// return something coherent.
+    ///
+    /// `request` and `response` are the JSON projections of the decoded and the
+    /// generated messages.
+    pub fn resolve_grpc(
+        &self,
+        scenario: Option<&str>,
+        session: Option<&str>,
+        method_path: &str,
+        request: &Value,
+        response: &Value,
+    ) -> Resolution {
+        // gRPC has no `Prefer` convention of its own, but the directives arrive as
+        // lowercase metadata, so the same names carry over.
+        self.resolve_with(
+            scenario,
+            session,
+            "unary",
+            method_path,
+            &HashMap::new(),
+            Some(request),
+            response,
+            false,
+            true,
+            // Store what the client will see, not what it sent.
+            CreateValue::Response,
+        )
+    }
+
     fn machine(&self, name: &str) -> Option<Scenario> {
         let entry = self.sidecar.scenario(name)?;
         Some(Scenario::new(
@@ -477,6 +515,34 @@ impl ScenarioRuntime {
         prefer_code: bool,
         validated: bool,
     ) -> Resolution {
+        self.resolve_with(
+            scenario_name,
+            session_key,
+            method,
+            path_template,
+            path_params,
+            request_body,
+            response_body,
+            prefer_code,
+            validated,
+            CreateValue::FollowKeySource,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_with(
+        &self,
+        scenario_name: Option<&str>,
+        session_key: Option<&str>,
+        method: &str,
+        path_template: &str,
+        path_params: &HashMap<String, String>,
+        request_body: Option<&Value>,
+        response_body: &Value,
+        prefer_code: bool,
+        validated: bool,
+        create_value: CreateValue,
+    ) -> Resolution {
         // `Prefer: code=` bypasses the machine entirely (ADR 0001).
         if prefer_code {
             return Resolution::Ungoverned;
@@ -523,7 +589,14 @@ impl ScenarioRuntime {
         }
 
         let store_result = operation.store.as_ref().map(|spec| {
-            apply_store(&instance.store, spec, path_params, request_body, response_body)
+            apply_store(
+                &instance.store,
+                spec,
+                path_params,
+                request_body,
+                response_body,
+                create_value,
+            )
         });
 
         let mut outcome = match store_result {
@@ -696,9 +769,46 @@ fn resolve_create_key(
         KeyLocation::Request => request_body?,
         KeyLocation::Response => response_body,
     };
+    pointer_value(subject, &source.pointer)
+}
+
+/// Write `identifier` into `value` at `pointer`, adding the field if absent.
+///
+/// A no-op for the empty pointer, which addresses the whole document and so has
+/// nowhere to put a field.
+fn align_identifier(value: &mut Value, pointer: &str, identifier: &str) {
+    if pointer.is_empty() {
+        return;
+    }
+    let segments: Vec<&str> = pointer.trim_start_matches('/').split('/').collect();
+    let Some((last, parents)) = segments.split_last() else {
+        return;
+    };
+
+    let mut node = value;
+    for segment in parents {
+        if !node.is_object() {
+            *node = Value::Object(serde_json::Map::new());
+        }
+        node = node
+            .as_object_mut()
+            .expect("just ensured an object")
+            .entry((*segment).to_owned())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    }
+    if !node.is_object() {
+        *node = Value::Object(serde_json::Map::new());
+    }
+    node.as_object_mut()
+        .expect("just ensured an object")
+        .insert((*last).to_owned(), Value::String(identifier.to_owned()));
+}
+
+/// Follow a JSON pointer, returning `None` if any segment is absent.
+fn pointer_value(subject: &Value, pointer: &str) -> Option<String> {
     let mut node = subject;
-    if !source.pointer.is_empty() {
-        for segment in source.pointer.trim_start_matches('/').split('/') {
+    if !pointer.is_empty() {
+        for segment in pointer.trim_start_matches('/').split('/') {
             node = node.get(segment)?;
         }
     }
@@ -709,12 +819,28 @@ fn resolve_create_key(
     })
 }
 
+/// What a `create` puts in the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CreateValue {
+    /// Whatever `keyFrom` points at, which is right for HTTP where a request and
+    /// its response share a schema.
+    FollowKeySource,
+    /// Always the generated response.
+    ///
+    /// gRPC needs this: a request and its response are distinct protobuf types,
+    /// so storing the request and returning it as the response would hand the
+    /// client bytes of the wrong message. Storing the response is what makes
+    /// "create, then get" return something coherent.
+    Response,
+}
+
 fn apply_store(
     store: &Store,
     spec: &StoreSpec,
     path_params: &HashMap<String, String>,
     request_body: Option<&Value>,
     response_body: &Value,
+    create_value: CreateValue,
 ) -> Result<Resolution, StatefulFailure> {
     let namespace = bind_namespace(&spec.resource, path_params);
 
@@ -728,10 +854,24 @@ fn apply_store(
             // store under. Refusing beats inventing a key.
             return Err(StatefulFailure::ResourceNotFound { key: namespace });
         };
-        let key = StoreKey::new(namespace, id);
-        let value = match spec.key_from.as_ref().map(|source| source.location) {
-            Some(KeyLocation::Request) => request_body.cloned().unwrap_or(Value::Null),
-            _ => response_body.clone(),
+        let key = StoreKey::new(namespace, id.clone());
+        let from_request = create_value == CreateValue::FollowKeySource &&
+            spec.key_from.as_ref().is_some_and(|source| source.location == KeyLocation::Request);
+
+        // When the generated response is what gets stored, its identifier has to
+        // agree with the key it is filed under. Otherwise a gRPC create files the
+        // client's id alongside a faker id, and reading it back by the id the
+        // client was just handed misses.
+        let value = if from_request {
+            request_body.cloned().unwrap_or(Value::Null)
+        } else {
+            let mut value = response_body.clone();
+            if create_value == CreateValue::Response &&
+                let Some(source) = spec.key_from.as_ref()
+            {
+                align_identifier(&mut value, &source.pointer, &id);
+            }
+            value
         };
         return store
             .create(&key, value.clone())
