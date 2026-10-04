@@ -325,6 +325,73 @@ just lint
 just test
 ```
 
+## Testing Strategy
+
+The test suite is layered so that each layer catches a different class of defect.
+
+| Layer | Where | Runs in |
+| --- | --- | --- |
+| Unit tests | `#[cfg(test)]` modules next to the code | `just test` |
+| Property tests | `proptest` blocks in the same modules | `just test` |
+| Integration / E2E | `crates/*/tests/*.rs` | `just test` |
+| Fuzzing | `crates/*/fuzz/fuzz_targets/*.rs` | `just fuzz` |
+| Coverage | instrumented re-run of the suite | `just test-coverage` |
+
+Property tests reseed on every run, so a single green run is not evidence that a
+property is sound. Run the suite a few times, and commit any
+`proptest-regressions/` files that appear — each one is a minimal counterexample
+that should stay covered from then on.
+
+### Unit and property tests
+
+`just test` runs everything, including the `proptest` properties — they are part
+of the normal loop, not a separate command. Each module pairs example-based
+tests for named cases with properties for invariants that must hold across many
+generated inputs:
+
+- `faker` — generation is deterministic per seed, integer/string/array bounds are
+  always honoured, and hostile schemas never panic.
+- `validate` — the validator cache key is insensitive to member ordering but
+  sensitive to any leaf change, so two schemas never share a validator.
+- `ref_resolver` — JSON-pointer navigation returns the addressed node or `None`,
+  and `split_ref` always partitions the input on the first `#`.
+- `schema` — extracted mappings are always sorted and stringly typed.
+- `router` — declared templates always match their instantiation, while
+  unrelated paths never match.
+- `media` — the JSON/XML/text/binary families stay mutually exclusive, XML output
+  is always a balanced single-rooted tree, and raw metacharacters never survive
+  escaping.
+- `negotiate` — content negotiation always yields a declared media type and
+  preference parsing never panics.
+- `openapi` — parsing an arbitrary document never panics.
+- `protobuf` — gRPC framing round-trips exactly, and decoding arbitrary bytes
+  either succeeds within the frame bounds or fails cleanly.
+- `asyncapi` — every handled message returns a well-formed outcome.
+- `runtime` — startup hashing is total and deterministic, and error rendering
+  never leaks absolute paths.
+- `sdk` — the configuration builder accepts any chain of settings without panicking.
+
+### Fuzzing
+
+Fuzz targets live in the crate that owns the code under test and are excluded
+from the workspace, so they never slow down `cargo test`:
+
+```bash
+just fuzz-build          # compile the targets
+just fuzz 60             # 60s per target
+just fuzz-smoke 10       # short CI-friendly run
+just ci-fuzz             # lint + test + build + smoke fuzz
+```
+
+| Target | Crate | Invariant |
+| --- | --- | --- |
+| `ref_resolver` | `specmock-core` | `$ref` resolution of hostile documents and ref strings never panics |
+| `json_pointer` | `specmock-core` | pointer navigation never returns a value absent from the document |
+| `faker` | `specmock-core` | generation is deterministic, bounded, and panic-free |
+| `validate` | `specmock-core` | validation is total and its issues are always fully populated |
+| `media_encode` | `specmock-runtime` | encoding never panics; JSON round-trips; XML stays balanced |
+| `negotiate` | `specmock-runtime` | negotiation only ever returns a declared media type |
+
 ### Integration Tests (Prism Comparison)
 
 The `integration-test` command runs a side-by-side comparison suite against [Prism](https://stoplight.io/open-source/prism) to verify that spec-mock and Prism return structurally equivalent responses.

@@ -28,3 +28,34 @@ jobs:
 
       - name: CI
         run: just ci
+
+  # Property tests live in the ordinary `cargo test` loop, so this job only has
+  # to prove the fuzz targets still build and run against a fresh corpus.
+  fuzz:
+    name: Fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          tool: just
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - name: Build fuzz targets
+        run: just fuzz-build
+
+      - name: Fuzz smoke run
+        run: just fuzz-smoke 15
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: fuzz-crashes
+          path: |
+            crates/*/fuzz/artifacts
+            crates/*/fuzz/corpus
+          if-no-files-found: ignore
