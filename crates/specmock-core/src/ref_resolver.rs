@@ -786,4 +786,479 @@ mod tests {
         let v = json!({"a": 1});
         assert_eq!(resolve_pointer(&v, "/b"), None);
     }
+
+    // ── split_ref edge cases ───────────────────────────────────────────
+
+    #[test]
+    fn split_ref_bare_hash_yields_empty_parts() {
+        assert_eq!(split_ref("#"), ("", ""));
+    }
+
+    #[test]
+    fn split_ref_keeps_hash_after_first() {
+        assert_eq!(split_ref("./a.json#/x#y"), ("./a.json", "/x#y"));
+    }
+
+    #[test]
+    fn split_ref_absolute_path_without_pointer() {
+        assert_eq!(split_ref("/abs/path/schema.yaml"), ("/abs/path/schema.yaml", ""));
+    }
+
+    // ── resolve_pointer edge cases ─────────────────────────────────────
+
+    #[test]
+    fn resolve_pointer_slash_returns_root() {
+        let v = json!({"a": 1});
+        assert_eq!(resolve_pointer(&v, "/"), Some(v.clone()));
+    }
+
+    #[test]
+    fn resolve_pointer_unescapes_json_pointer_tokens() {
+        let v = json!({"a/b": {"c~d": 7}, "m~n": 8});
+        assert_eq!(resolve_pointer(&v, "/a~1b/c~0d"), Some(json!(7)));
+        assert_eq!(resolve_pointer(&v, "/m~0n"), Some(json!(8)));
+    }
+
+    #[test]
+    fn resolve_pointer_handles_array_indices() {
+        let v = json!({"items": [{"id": "a"}, {"id": "b"}]});
+        assert_eq!(resolve_pointer(&v, "/items/0/id"), Some(json!("a")));
+        assert_eq!(resolve_pointer(&v, "/items/1/id"), Some(json!("b")));
+    }
+
+    #[test]
+    fn resolve_pointer_rejects_out_of_range_and_invalid_indices() {
+        let v = json!({"items": [1]});
+        assert_eq!(resolve_pointer(&v, "/items/5"), None, "out-of-range index");
+        assert_eq!(resolve_pointer(&v, "/items/-1"), None, "negative index");
+        assert_eq!(resolve_pointer(&v, "/items/abc"), None, "non-numeric index");
+    }
+
+    #[test]
+    fn resolve_pointer_through_scalar_returns_none() {
+        let v = json!({"a": 5});
+        assert_eq!(resolve_pointer(&v, "/a/b"), None, "cannot descend into a scalar");
+    }
+
+    #[test]
+    fn resolve_pointer_into_missing_object_returns_none() {
+        let v = json!({"a": {"b": 1}});
+        assert_eq!(resolve_pointer(&v, "/a/zzz/deep"), None);
+    }
+
+    #[test]
+    fn resolve_pointer_accepts_pointer_without_leading_slash() {
+        let v = json!({"a": {"b": 2}});
+        assert_eq!(resolve_pointer(&v, "a/b"), Some(json!(2)));
+    }
+
+    #[test]
+    fn resolve_pointer_supports_root_scalars() {
+        assert_eq!(resolve_pointer(&json!(5), "/"), Some(json!(5)));
+        assert_eq!(resolve_pointer(&json!(5), ""), Some(json!(5)));
+    }
+
+    // ── malformed $ref nodes ───────────────────────────────────────────
+
+    #[test]
+    fn non_string_ref_is_rejected() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let doc = json!({"schema": {"$ref": 42}});
+        let main_file = write_json(tmp.path(), "api.json", &doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let error = resolver.resolve(&main_file).expect_err("non-string $ref must fail");
+        assert!(error.to_string().contains("not a string"), "error: {error}");
+    }
+
+    #[test]
+    fn sibling_properties_on_scalar_ref_target_are_dropped() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let doc = json!({
+            "components": {"schemas": {"Name": {"type": "string", "title": "T"}}},
+            "schema": {"$ref": "#/components/schemas/Name", "description": "dropped"}
+        });
+        let main_file = write_json(tmp.path(), "api.json", &doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+
+        // The target is an object, so siblings merge.
+        assert_eq!(resolved["schema"]["description"], "dropped");
+
+        // Now point at a scalar target where siblings must be dropped.
+        let doc = json!({
+            "components": {"schemas": {"Name": "just-a-string"}},
+            "schema": {"$ref": "#/components/schemas/Name", "description": "dropped"}
+        });
+        let main_file = write_json(tmp.path(), "scalar.json", &doc);
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+        assert_eq!(resolved["schema"], json!("just-a-string"), "scalar target replaces the node");
+    }
+
+    #[test]
+    fn resolve_target_keys_win_over_sibling_keys() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let doc = json!({
+            "components": {"schemas": {"Pet": {"type": "object", "type_hint": "from-target"}}},
+            "schema": {"$ref": "#/components/schemas/Pet", "type_hint": "from-sibling"}
+        });
+        let main_file = write_json(tmp.path(), "api.json", &doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+        assert_eq!(
+            resolved["schema"]["type_hint"], "from-target",
+            "sibling keys must not overwrite keys already present on the target"
+        );
+    }
+
+    // ── resolve_value_tree ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_value_tree_inlines_local_refs_in_place() {
+        let mut document = json!({
+            "components": {"schemas": {"Id": {"type": "integer", "minimum": 1}}},
+            "target": {"$ref": "#/components/schemas/Id"}
+        });
+
+        let mut resolver = RefResolver::new(std::env::temp_dir());
+        resolver.resolve_value_tree(&mut document).expect("resolve tree");
+
+        assert_eq!(document["target"]["type"], "integer");
+        assert_eq!(document["target"]["minimum"], 1);
+        assert!(document["target"].get("$ref").is_none());
+    }
+
+    #[test]
+    fn resolve_value_tree_propagates_errors() {
+        let mut document = json!({"target": {"$ref": "#/components/schemas/Missing"}});
+        let mut resolver = RefResolver::new(std::env::temp_dir());
+        assert!(resolver.resolve_value_tree(&mut document).is_err());
+    }
+
+    // ── file loading ───────────────────────────────────────────────────
+
+    #[test]
+    fn missing_root_file_is_reported() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let error = resolver.resolve(&tmp.path().join("nope.json")).expect_err("must fail");
+        assert!(error.to_string().contains("cannot canonicalize"), "error: {error}");
+    }
+
+    #[test]
+    fn malformed_json_root_file_is_reported() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let path = tmp.path().join("broken.json");
+        std::fs::write(&path, "{ not json").expect("write");
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let error = resolver.resolve(&path).expect_err("must fail");
+        assert!(error.to_string().contains("JSON parse error"), "error: {error}");
+    }
+
+    #[test]
+    fn extensionless_root_file_is_parsed_as_json() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let path = tmp.path().join("spec");
+        std::fs::write(&path, r#"{"paths":{}}"#).expect("write");
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&path).expect("extensionless JSON must parse");
+        assert_eq!(resolved["paths"], json!({}));
+    }
+
+    #[test]
+    fn malformed_yaml_external_file_is_reported() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_yaml(tmp.path(), "bad.yaml", "key: [unclosed\n  other: : :\n");
+
+        let main_doc = json!({"schema": {"$ref": "./bad.yaml"}});
+        let main_file = write_json(tmp.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let error = resolver.resolve(&main_file).expect_err("must fail");
+        assert!(error.to_string().contains("YAML parse error"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn yml_extension_is_also_parsed_as_yaml() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_yaml(tmp.path(), "shared.yml", "Pet:\n  type: object\n  title: Yml\n");
+
+        let main_doc = json!({"schema": {"$ref": "./shared.yml#/Pet"}});
+        let main_file = write_json(tmp.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+        assert_eq!(resolved["schema"]["title"], "Yml");
+    }
+
+    #[test]
+    fn external_ref_with_missing_pointer_is_reported() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_json(tmp.path(), "shared.json", &json!({"Present": {"type": "string"}}));
+
+        let main_doc = json!({"schema": {"$ref": "./shared.json#/Absent"}});
+        let main_file = write_json(tmp.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let error = resolver.resolve(&main_file).expect_err("must fail");
+        assert!(error.to_string().contains("not found in"), "error: {error}");
+    }
+
+    #[test]
+    fn external_ref_without_pointer_inlines_whole_document() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_json(tmp.path(), "whole.json", &json!({"type": "object", "title": "Whole"}));
+
+        let main_doc = json!({"schema": {"$ref": "./whole.json"}});
+        let main_file = write_json(tmp.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+        assert_eq!(resolved["schema"]["title"], "Whole");
+    }
+
+    // ── cache configuration ────────────────────────────────────────────
+
+    #[test]
+    fn zero_cache_limit_is_coerced_to_one() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_json(tmp.path(), "a.json", &json!({"A": {"type": "string"}}));
+        write_json(tmp.path(), "b.json", &json!({"B": {"type": "integer"}}));
+
+        let main_a = write_json(tmp.path(), "main_a.json", &json!({"s": {"$ref": "./a.json#/A"}}));
+        let main_b = write_json(tmp.path(), "main_b.json", &json!({"s": {"$ref": "./b.json#/B"}}));
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf()).with_external_cache_limit(0);
+        resolver.resolve(&main_a).expect("resolve a");
+        resolver.resolve(&main_b).expect("resolve b");
+
+        assert_eq!(
+            resolver.external_cache_size_for_tests(),
+            1,
+            "a zero cache limit must be clamped to a single entry"
+        );
+    }
+
+    #[test]
+    fn repeated_resolve_reuses_the_cached_document() {
+        let tmp = TempDir::new().expect("tmpdir");
+        write_json(tmp.path(), "shared.json", &json!({"Pet": {"type": "object"}}));
+
+        let main_doc = json!({
+            "a": {"$ref": "./shared.json#/Pet"},
+            "b": {"$ref": "./shared.json#/Pet"}
+        });
+        let main_file = write_json(tmp.path(), "api.json", &main_doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        resolver.resolve(&main_file).expect("resolve");
+
+        assert_eq!(
+            resolver.external_cache_size_for_tests(),
+            1,
+            "two refs into the same file must share one cache entry"
+        );
+    }
+
+    #[test]
+    fn duplicate_allowed_roots_are_deduplicated() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let root = tmp.path().to_path_buf();
+
+        let resolver = RefResolver::new(root.clone())
+            .with_allowed_root(root.clone())
+            .with_allowed_roots([root.clone(), root.clone()]);
+
+        assert_eq!(
+            resolver.allowed_roots.len(),
+            1,
+            "adding the same canonical root repeatedly must not grow the allow-list"
+        );
+    }
+
+    #[test]
+    fn multiple_distinct_allowed_roots_are_all_recorded() {
+        let a = TempDir::new().expect("tmpdir a");
+        let b = TempDir::new().expect("tmpdir b");
+        let c = TempDir::new().expect("tmpdir c");
+
+        let resolver = RefResolver::new(a.path().to_path_buf())
+            .with_allowed_roots([b.path().to_path_buf(), c.path().to_path_buf()]);
+
+        assert_eq!(resolver.allowed_roots.len(), 3);
+    }
+
+    #[test]
+    fn nonexistent_allowed_root_falls_back_to_literal_path() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let missing = tmp.path().join("does-not-exist");
+
+        let resolver =
+            RefResolver::new(tmp.path().to_path_buf()).with_allowed_root(missing.clone());
+        assert!(
+            resolver.allowed_roots.iter().any(|root| root == &missing),
+            "an uncanonicalizable root must still be recorded verbatim"
+        );
+    }
+
+    #[test]
+    fn nonexistent_base_dir_does_not_panic() {
+        let resolver = RefResolver::new(PathBuf::from("/definitely/not/here/anywhere"));
+        assert_eq!(resolver.allowed_roots.len(), 1);
+        assert_eq!(resolver.base_dir, PathBuf::from("/definitely/not/here/anywhere"));
+    }
+
+    #[test]
+    fn zero_max_depth_rejects_any_ref() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let doc = json!({
+            "components": {"schemas": {"Pet": {"type": "string"}}},
+            "schema": {"$ref": "#/components/schemas/Pet"}
+        });
+        let main_file = write_json(tmp.path(), "api.json", &doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf()).with_max_depth(0);
+        assert!(resolver.resolve(&main_file).is_err(), "a zero depth budget cannot resolve a ref");
+    }
+
+    #[test]
+    fn deep_local_ref_chain_is_resolved() {
+        let tmp = TempDir::new().expect("tmpdir");
+        let doc = json!({
+            "components": {
+                "schemas": {
+                    "L0": {"type": "string", "title": "leaf"},
+                    "L1": {"$ref": "#/components/schemas/L0"},
+                    "L2": {"$ref": "#/components/schemas/L1"},
+                    "L3": {"$ref": "#/components/schemas/L2"},
+                    "L4": {"$ref": "#/components/schemas/L3"}
+                }
+            },
+            "target": {"$ref": "#/components/schemas/L4"}
+        });
+        let main_file = write_json(tmp.path(), "api.json", &doc);
+
+        let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+        let resolved = resolver.resolve(&main_file).expect("resolve");
+        assert_eq!(resolved["target"]["title"], "leaf");
+    }
+
+    #[test]
+    fn http_ref_with_different_scheme_is_rejected() {
+        let tmp = TempDir::new().expect("tmpdir");
+        for target in ["http://example.com/a.json", "https://example.com/a.json"] {
+            let doc = json!({"schema": {"$ref": target}});
+            let main_file = write_json(tmp.path(), "api.json", &doc);
+            let mut resolver = RefResolver::new(tmp.path().to_path_buf());
+            let error = resolver.resolve(&main_file).expect_err("must fail");
+            assert!(error.to_string().contains("URL-based"), "{target}: {error}");
+        }
+    }
+
+    // ── property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// A small JSON document plus a pointer that reaches a real member of it.
+    ///
+    /// The pointer is always derived from a key the document actually contains,
+    /// so the round-trip property below is meaningful rather than vacuous. Keys
+    /// may collide, so the map is built first and the expected value is read
+    /// back out of it; capturing the needle during insertion would let a later
+    /// duplicate overwrite the value the pointer must resolve to.
+    fn document_and_pointer() -> impl Strategy<Value = (Value, String, Value)> {
+        prop::collection::vec(("[a-z][a-z0-9_]{0,7}", "[A-Za-z0-9 ]{0,8}"), 1..6).prop_map(
+            |entries| {
+                let mut members = serde_json::Map::new();
+                for (key, text) in entries {
+                    members.insert(key, Value::String(text));
+                }
+
+                let (key, value) =
+                    members.iter().next().expect("strategy yields at least one entry");
+                (Value::Object(members.clone()), format!("/{key}"), value.clone())
+            },
+        )
+    }
+
+    /// Recursive strategy for arbitrary JSON values.
+    ///
+    /// `serde_json::Value` does not implement `proptest::Arbitrary`, so the
+    /// generator is assembled from bounded leaf and container shapes.
+    fn any_json() -> impl Strategy<Value = Value> {
+        let leaf = prop_oneof![
+            any::<bool>().prop_map(Value::from),
+            any::<i64>().prop_map(Value::from),
+            "[ -~]{0,8}".prop_map(Value::from),
+        ];
+        leaf.prop_recursive(3, 12, 3, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                prop::collection::hash_map("[a-z]{1,6}", inner, 0..4).prop_map(|members| {
+                    let map: serde_json::Map<String, Value> = members.into_iter().collect();
+                    Value::Object(map)
+                }),
+            ]
+        })
+    }
+
+    // `rustfmt` cannot parse the `proptest!` DSL, so this block is left verbatim.
+
+    #[rustfmt::skip]
+
+    proptest! {
+        /// Resolving a pointer built from an actual key must return exactly the
+        /// value stored under that key.
+        #[test]
+        fn resolve_pointer_returns_the_addressed_member(
+            (document, pointer, expected) in document_and_pointer()
+        ) {
+            prop_assert_eq!(resolve_pointer(&document, &pointer), Some(expected));
+        }
+
+        /// An empty pointer and "/" both denote the whole document.
+        #[test]
+        fn empty_pointers_return_the_document(document in any_json())
+        {
+            prop_assert_eq!(resolve_pointer(&document, ""), Some(document.clone()));
+            prop_assert_eq!(resolve_pointer(&document, "/"), Some(document));
+        }
+
+        /// Whatever the pointer text, resolution either finds a node or returns
+        /// `None` — it must never panic or produce a partially-walked result.
+        #[test]
+        fn arbitrary_pointers_never_panic(
+            document in any_json(),
+            pointer in "[a-zA-Z0-9~/._-]{0,40}",
+        ) {
+            let _ = resolve_pointer(&document, &pointer);
+        }
+
+        /// `split_ref` always partitions the input on the first `#`, so the
+        /// concatenation of its two outputs must reproduce the input.
+        #[test]
+        fn split_ref_preserves_the_input(input in "[^#]{0,40}")
+        {
+            let (file, pointer) = split_ref(&input);
+            prop_assert_eq!(file, input.as_str());
+            prop_assert_eq!(pointer, "");
+        }
+
+        #[test]
+        fn split_ref_preserves_the_input_with_a_hash(
+            prefix in "[^#]{0,20}",
+            suffix in "[^#]{0,20}",
+        ) {
+            let input = format!("{prefix}#{suffix}");
+            let (file, pointer) = split_ref(&input);
+            prop_assert_eq!(format!("{file}#{pointer}"), input.as_str());
+            prop_assert_eq!(file, prefix.as_str());
+            prop_assert_eq!(pointer, suffix.as_str());
+        }
+    }
 }

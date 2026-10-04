@@ -84,12 +84,12 @@ impl PathRouter {
     pub fn match_route(&self, method: &Method, path: &str) -> Option<RouteMatch> {
         let segments = split_path(path);
         let mut params = HashMap::new();
-        let node = walk(&self.root, &segments, &mut params)?;
+        let node = walk(&self.root, &segments, &mut params, method)?;
 
-        node.operations
-            .iter()
-            .find(|(m, _)| m == method)
-            .map(|&(_, operation_index)| RouteMatch { operation_index, path_params: params })
+        let operation_index =
+            node.operations.iter().find(|(m, _)| m == method).map(|&(_, index)| index)?;
+
+        Some(RouteMatch { operation_index, path_params: params })
     }
 }
 
@@ -152,14 +152,21 @@ fn insert(node: &mut RadixNode, segments: &[SegmentMatcher], method: Method, ind
 
 /// Recursively walk the tree and collect path parameters.
 ///
+/// Returns the terminal `RadixNode` only when that node declares an operation
+/// for `method`. The method is threaded through the walk because two templates
+/// can share a shape yet differ in parameter name (`/{a}` and `/{b}` become
+/// separate edges); without this, the first such edge would swallow the request
+/// and a method declared only on a sibling edge would be unreachable.
+///
 /// Returns the terminal `RadixNode` if the walk succeeds.
 fn walk<'a>(
     node: &'a RadixNode,
     segments: &[&str],
     params: &mut HashMap<String, String>,
+    method: &Method,
 ) -> Option<&'a RadixNode> {
     if segments.is_empty() {
-        return Some(node);
+        return node.operations.iter().any(|(m, _)| m == method).then_some(node);
     }
 
     let (head, tail) = segments.split_first()?;
@@ -169,7 +176,7 @@ fn walk<'a>(
     for edge in &node.children {
         if let SegmentMatcher::Literal(ref lit) = edge.segment &&
             lit == head &&
-            let Some(result) = walk(&edge.child, tail, params)
+            let Some(result) = walk(&edge.child, tail, params, method)
         {
             return Some(result);
         }
@@ -180,7 +187,7 @@ fn walk<'a>(
         if let SegmentMatcher::Param(ref name) = edge.segment {
             let mut candidate_params = params.clone();
             candidate_params.insert(name.clone(), (*head).to_owned());
-            if let Some(result) = walk(&edge.child, tail, &mut candidate_params) {
+            if let Some(result) = walk(&edge.child, tail, &mut candidate_params, method) {
                 *params = candidate_params;
                 return Some(result);
             }
@@ -211,6 +218,32 @@ mod tests {
             responses: vec![],
             callbacks: vec![],
         }
+    }
+
+    /// Regression: templates that differ only in parameter name build sibling
+    /// parameter edges, so matching must stay method-aware across them. Committing
+    /// to the first edge made `POST /{b}` unreachable behind `GET /{a}`.
+    #[test]
+    fn param_name_collision_keeps_every_method_routable() {
+        let ops = vec![op(Method::GET, "/{a}"), op(Method::POST, "/{b}")];
+        let router = PathRouter::build(&ops);
+
+        let get = router.match_route(&Method::GET, "/v0").expect("GET must route");
+        assert_eq!(get.operation_index, 0);
+        assert_eq!(get.path_params.get("a").map(String::as_str), Some("v0"));
+
+        let post = router.match_route(&Method::POST, "/v0").expect("POST must route");
+        assert_eq!(post.operation_index, 1);
+        assert_eq!(post.path_params.get("b").map(String::as_str), Some("v0"));
+    }
+
+    /// A method declared on no route at all must still report no match.
+    #[test]
+    fn undeclared_method_on_a_colliding_shape_does_not_route() {
+        let ops = vec![op(Method::GET, "/{a}"), op(Method::POST, "/{b}")];
+        let router = PathRouter::build(&ops);
+
+        assert!(router.match_route(&Method::DELETE, "/v0").is_none());
     }
 
     #[test]
@@ -367,5 +400,421 @@ mod tests {
         let ops = vec![op(Method::GET, "/pets/{petId}/toys")];
         let router = PathRouter::build(&ops);
         assert!(router.match_route(&Method::GET, "/pets/1").is_none());
+    }
+
+    // ── segment parsing ────────────────────────────────────────────────
+
+    #[test]
+    fn empty_path_templates_match_the_root() {
+        for template in ["", "/", "//"] {
+            let ops = vec![op(Method::GET, template)];
+            let router = PathRouter::build(&ops);
+            assert!(router.match_route(&Method::GET, "/").is_some(), "template {template:?}");
+            assert!(router.match_route(&Method::GET, "").is_some(), "template {template:?}");
+            assert!(router.match_route(&Method::GET, "/x").is_none(), "template {template:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_slashes_are_collapsed_on_both_sides() {
+        let ops = vec![op(Method::GET, "/a//b")];
+        let router = PathRouter::build(&ops);
+        assert!(router.match_route(&Method::GET, "/a/b").is_some());
+        assert!(router.match_route(&Method::GET, "//a//b//").is_some());
+    }
+
+    #[test]
+    fn braces_that_do_not_delimit_a_parameter_stay_literal() {
+        let ops = vec![op(Method::GET, "/a/{}")];
+        let router = PathRouter::build(&ops);
+        // `{}` is too short to be a parameter, so it is a literal segment.
+        assert!(router.match_route(&Method::GET, "/a/{}").is_some());
+        assert!(router.match_route(&Method::GET, "/a/x").is_none());
+    }
+
+    #[test]
+    fn half_open_braces_stay_literal() {
+        for template in ["/a/{id", "/a/id}", "/a/{{id}}"] {
+            let ops = vec![op(Method::GET, template)];
+            let router = PathRouter::build(&ops);
+            let expected = template.trim_matches('/');
+            assert!(
+                router.match_route(&Method::GET, &format!("/{expected}")).is_some(),
+                "{template} should be matched literally"
+            );
+        }
+    }
+
+    #[test]
+    fn request_path_segments_may_contain_braces() {
+        let ops = vec![op(Method::GET, "/a/{id}")];
+        let router = PathRouter::build(&ops);
+        let matched = router.match_route(&Method::GET, "/a/literal");
+        assert!(matched.is_some(), "a concrete value with braces still fills the parameter");
+    }
+
+    // ── precedence ─────────────────────────────────────────────────────
+
+    #[test]
+    fn literal_wins_over_param_across_the_whole_path() {
+        let ops = vec![op(Method::GET, "/a/{x}/c"), op(Method::GET, "/a/b/d")];
+        let router = PathRouter::build(&ops);
+
+        // The literal branch at segment 2 is tried first and abandoned when it
+        // cannot complete, so the parameter branch still serves `/a/b/c`.
+        let fallback = router
+            .match_route(&Method::GET, "/a/b/c")
+            .expect("the parameter branch must serve this path");
+        assert_eq!(fallback.operation_index, 0);
+        assert_eq!(fallback.path_params.get("x").map(String::as_str), Some("b"));
+        assert_eq!(
+            router.match_route(&Method::GET, "/a/b/d").expect("literal route").operation_index,
+            1
+        );
+        assert_eq!(
+            router.match_route(&Method::GET, "/a/z/c").expect("param route").operation_index,
+            0
+        );
+    }
+
+    /// Routing matches on (method, path), so a literal that is more specific but
+    /// registered for a different method must not shadow a parameter route that
+    /// does serve the request.
+    #[test]
+    fn a_literal_match_on_the_wrong_method_falls_back_to_a_param_route() {
+        let ops = vec![op(Method::POST, "/pets/mine"), op(Method::GET, "/pets/{petId}")];
+        let router = PathRouter::build(&ops);
+
+        let get = router.match_route(&Method::GET, "/pets/mine").expect("param route");
+        assert_eq!(get.operation_index, 1);
+        assert_eq!(get.path_params.get("petId").map(String::as_str), Some("mine"));
+        assert_eq!(
+            router.match_route(&Method::POST, "/pets/mine").expect("literal route").operation_index,
+            0
+        );
+        assert_eq!(
+            router.match_route(&Method::GET, "/pets/42").expect("param route").operation_index,
+            1
+        );
+    }
+
+    #[test]
+    fn empty_path_params_are_not_leaked_between_matches() {
+        let ops = vec![op(Method::GET, "/pets/{petId}")];
+        let router = PathRouter::build(&ops);
+
+        let first = router.match_route(&Method::GET, "/pets/1").expect("matched");
+        assert_eq!(first.path_params.len(), 1);
+
+        // A failed walk must not mutate the caller's parameter map; re-run and
+        // confirm the tree is unaffected.
+        assert!(router.match_route(&Method::GET, "/pets/1/extra").is_none());
+        let second = router.match_route(&Method::GET, "/pets/2").expect("matched");
+        assert_eq!(second.path_params.get("petId").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn a_deeper_literal_takes_precedence_over_a_shallower_param() {
+        let ops = vec![op(Method::GET, "/a/{x}"), op(Method::GET, "/a/b")];
+        let router = PathRouter::build(&ops);
+        let matched = router.match_route(&Method::GET, "/a/b").expect("matched");
+        assert_eq!(matched.operation_index, 1);
+        assert!(matched.path_params.is_empty(), "the literal route declares no parameters");
+    }
+
+    // ── edge cases ─────────────────────────────────────────────────────
+
+    #[test]
+    fn empty_router_matches_nothing() {
+        let router = PathRouter::build(&[]);
+        assert!(router.match_route(&Method::GET, "/").is_none());
+        assert!(router.match_route(&Method::GET, "/pets").is_none());
+    }
+
+    #[test]
+    fn duplicate_routes_keep_the_first_index() {
+        let ops = vec![op(Method::GET, "/pets"), op(Method::GET, "/pets")];
+        let router = PathRouter::build(&ops);
+        assert_eq!(router.match_route(&Method::GET, "/pets").expect("matched").operation_index, 0);
+    }
+
+    #[test]
+    fn very_deep_paths_are_supported() {
+        let template: String = (0..40).map(|index| format!("/s{index}")).collect();
+        let mut operations = vec![op(Method::GET, &template)];
+        for index in 0..40 {
+            operations.push(op(Method::GET, &format!("{template}/s{index}")));
+        }
+        let router = PathRouter::build(&operations);
+
+        assert!(router.match_route(&Method::GET, &template).is_some());
+        let deepest = format!("{template}/s0/s1/s2/s3");
+        assert!(router.match_route(&Method::GET, &deepest).is_none(), "only declared depths match");
+    }
+
+    #[test]
+    fn many_parameters_are_all_captured() {
+        let mut template = String::from("/root");
+        let mut path = String::from("/root");
+        let mut expected = std::collections::BTreeMap::new();
+        for index in 0..12 {
+            let name = format!("p{index}");
+            let value = format!("v{index}");
+            template.push_str(&format!("/{{{name}}}"));
+            path.push('/');
+            path.push_str(&value);
+            expected.insert(name, value);
+        }
+
+        let ops = vec![op(Method::GET, &template)];
+        let router = PathRouter::build(&ops);
+        let matched = router.match_route(&Method::GET, &path).expect("matched");
+        assert_eq!(matched.path_params.len(), expected.len());
+
+        let actual: std::collections::BTreeMap<String, String> =
+            matched.path_params.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parameter_values_may_contain_slashes_free_text() {
+        let ops = vec![op(Method::GET, "/files/{name}")];
+        let router = PathRouter::build(&ops);
+        let matched = router.match_route(&Method::GET, "/files/report%20final").expect("matched");
+        assert_eq!(
+            matched.path_params.get("name").map(String::as_str),
+            Some("report%20final"),
+            "the router does not percent-decode; validation sees the raw segment"
+        );
+    }
+
+    #[test]
+    fn non_standard_methods_route_correctly() {
+        let ops = vec![op(Method::OPTIONS, "/x"), op(Method::HEAD, "/x"), op(Method::TRACE, "/x")];
+        let router = PathRouter::build(&ops);
+
+        assert_eq!(router.match_route(&Method::OPTIONS, "/x").expect("OPTIONS").operation_index, 0);
+        assert_eq!(router.match_route(&Method::HEAD, "/x").expect("HEAD").operation_index, 1);
+        assert_eq!(router.match_route(&Method::TRACE, "/x").expect("TRACE").operation_index, 2);
+    }
+
+    #[test]
+    fn a_custom_method_token_is_matched_verbatim() {
+        let custom = Method::from_bytes(b"PURGE").expect("custom method");
+        let ops = vec![op(custom.clone(), "/cache")];
+        let router = PathRouter::build(&ops);
+
+        assert!(router.match_route(&custom, "/cache").is_some());
+        assert!(
+            router.match_route(&Method::GET, "/cache").is_none(),
+            "a different method must not match"
+        );
+    }
+
+    // ── property tests ─────────────────────────────────────────────────
+
+    use proptest::prelude::*;
+
+    /// Build a random set of operations from random path templates.
+    fn any_operations() -> impl Strategy<Value = Vec<(Method, String)>> {
+        prop::collection::vec(
+            (
+                prop::sample::select(vec![Method::GET, Method::POST, Method::PUT, Method::DELETE]),
+                prop::collection::vec(
+                    prop_oneof![
+                        "[a-z]{1,5}".prop_map(|segment| segment),
+                        "[a-z]{1,5}".prop_map(|name| format!("{{{name}}}")),
+                    ],
+                    0..5,
+                ),
+            ),
+            1..10,
+        )
+        .prop_map(|entries| {
+            entries
+                .into_iter()
+                .map(|(method, segments)| (method, format!("/{}", segments.join("/"))))
+                .collect()
+        })
+    }
+
+    /// Realize a path that satisfies a template by filling parameters.
+    fn instantiate(template: &str, fill: u64) -> String {
+        let segments: Vec<&str> =
+            template.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+
+        // `/` has no segments to rejoin, so it must be reproduced verbatim;
+        // naively joining the (empty) segment list would yield `""` instead.
+        if segments.is_empty() {
+            return "/".to_owned();
+        }
+
+        let mut out = String::new();
+        for segment in segments {
+            out.push('/');
+            if segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2 {
+                out.push_str(&format!("v{fill}"));
+            } else {
+                out.push_str(segment);
+            }
+        }
+        out
+    }
+
+    /// Every `{param}` segment declared by a path template.
+    fn declared_params(template: &str) -> Vec<String> {
+        template
+            .trim_matches('/')
+            .split('/')
+            .filter(|segment| {
+                segment.len() > 2 && segment.starts_with('{') && segment.ends_with('}')
+            })
+            .map(|segment| segment[1..segment.len() - 1].to_owned())
+            .collect()
+    }
+
+    // `rustfmt` cannot parse the `proptest!` DSL, so this block is left verbatim.
+
+    #[rustfmt::skip]
+
+    proptest! {
+        /// Any template built from literals and `{param}` segments must match a
+        /// concretely-instantiated path, and every declared parameter must be
+        /// captured in `path_params`.
+        #[test]
+        fn templates_always_match_their_instantiation(
+            operations in any_operations(),
+            fill in any::<u64>(),
+        ) {
+            let specs: Vec<OperationSpec> = operations
+                .iter()
+                .map(|(method, template)| op(method.clone(), template))
+                .collect();
+            let router = PathRouter::build(&specs);
+
+            for (method, template) in &operations {
+                let path = instantiate(template, fill);
+
+                // A concrete instantiation of a declared template must always
+                // route. This is asserted rather than assumed, otherwise every
+                // non-matching case would be silently discarded and the property
+                // would hold vacuously.
+                let matched = router.match_route(method, &path);
+                prop_assert!(
+                    matched.is_some(),
+                    "template {:?} instantiated as {:?} did not match",
+                    template,
+                    path
+                );
+                let matched = matched.expect("checked above");
+
+                // The route that answered must accept this method, and every
+                // parameter it declares must be bound by the match.
+                let matched_template = &operations[matched.operation_index].1;
+                prop_assert_eq!(&operations[matched.operation_index].0, method);
+                for name in declared_params(matched_template) {
+                    prop_assert!(
+                        matched.path_params.contains_key(&name),
+                        "parameter {:?} declared in {:?} was not bound for {:?}",
+                        name,
+                        matched_template,
+                        path
+                    );
+                }
+            }
+        }
+
+        /// A path with more segments than any declared template never matches.
+        #[test]
+        fn overlong_paths_never_match(operations in any_operations(), noise in "[a-z]{1,5}") {
+            let specs: Vec<OperationSpec> = operations
+                .iter()
+                .map(|(method, template)| op(method.clone(), template))
+                .collect();
+            let router = PathRouter::build(&specs);
+
+            // Templates above hold at most four segments, so a longer path
+            // cannot correspond to any of them.
+            let deepest = specs
+                .iter()
+                .map(|spec| spec.path_template.split('/').filter(|s| !s.is_empty()).count())
+                .max()
+                .unwrap_or(0);
+            let mut path = String::new();
+            for _ in 0..=deepest {
+                path.push_str("/zz");
+            }
+            path.push('/');
+            path.push_str(&noise);
+
+            prop_assert!(router.match_route(&Method::GET, &path).is_none());
+        }
+
+        /// Whichever method is requested, a match implies the router has an
+        /// operation registered for exactly that method at that path.
+        #[test]
+        fn matches_always_agree_with_the_method(
+            operations in any_operations(),
+            fill in any::<u64>(),
+        ) {
+            let specs: Vec<OperationSpec> = operations
+                .iter()
+                .map(|(method, template)| op(method.clone(), template))
+                .collect();
+            let router = PathRouter::build(&specs);
+
+            for (_, template) in &operations {
+                let path = instantiate(template, fill);
+                for candidate in [Method::GET, Method::POST, Method::PUT, Method::DELETE] {
+                    if let Some(matched) = router.match_route(&candidate, &path) {
+                        prop_assert_eq!(
+                            &operations[matched.operation_index].0,
+                            &candidate,
+                            "matched a route registered for a different method"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Trailing-slash and duplicate-slash variations never change routing.
+        #[test]
+        fn slash_variations_do_not_change_routing(
+            operations in any_operations(),
+            fill in any::<u64>(),
+        ) {
+            let specs: Vec<OperationSpec> = operations
+                .iter()
+                .map(|(method, template)| op(method.clone(), template))
+                .collect();
+            let router = PathRouter::build(&specs);
+
+            for (method, template) in &operations {
+                let path = instantiate(template, fill);
+                let doubled = path.split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("//");
+                prop_assert_eq!(
+                    router.match_route(method, &path).map(|m| m.operation_index),
+                    router.match_route(method, &format!("/{doubled}")).map(|m| m.operation_index),
+                    "duplicate slashes changed the route for {:?}", path
+                );
+                prop_assert_eq!(
+                    router.match_route(method, &path).map(|m| m.operation_index),
+                    router.match_route(method, &format!("{path}/")).map(|m| m.operation_index),
+                    "a trailing slash changed the route for {:?}", path
+                );
+            }
+        }
+
+        /// Building a router from arbitrary operations never panics, and every
+        /// operation index stays reachable.
+        #[test]
+        fn building_never_panics(operations in any_operations()) {
+            let specs: Vec<OperationSpec> = operations
+                .iter()
+                .map(|(method, template)| op(method.clone(), template))
+                .collect();
+            let router = PathRouter::build(&specs);
+            let _ = router.match_route(&Method::GET, "/");
+        }
     }
 }
