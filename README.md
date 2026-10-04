@@ -474,8 +474,8 @@ let (scenario, state) = server.scenario_state("").unwrap();
   pitch is reproducibility.
 - Atomic read-modify-write. Two concurrent `PUT`s to one resource may interleave.
 
-Absent a sidecar, every one of the 839 tests behaves exactly as it did before
-scenarios existed. That regression guard is enforced by
+Absent a sidecar, every existing test behaves exactly as it did before scenarios
+existed. That regression guard is enforced by
 `an_absent_sidecar_leaves_plain_mocking_untouched`.
 
 ## Rust SDK

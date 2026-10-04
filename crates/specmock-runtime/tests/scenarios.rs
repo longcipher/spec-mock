@@ -788,3 +788,90 @@ async fn the_control_state_endpoint_lists_every_live_instance()
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn prefer_dynamic_bypasses_the_store_and_the_machine()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `dynamic=true` means "give me generated data, not the canned example". If it
+    // quietly returned a stored resource it would mean one thing with a scenario
+    // active and another without, so no header should change meaning based on
+    // hidden server state.
+    let Some(server) = boot(store_config()).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    // Drive the fragile scenario out of `healthy`, where the state declares a 503.
+    read(
+        hpx::Client::new()
+            .get(format!("{base}/gadgets/fragile-1"))
+            .header("Prefer", "scenario=fragile, session=d1")
+            .send()
+            .await?,
+    )
+    .await?;
+
+    let (status, _, _) = read(
+        hpx::Client::new()
+            .get(format!("{base}/gadgets/fragile-1"))
+            .header("Prefer", "scenario=fragile, session=d2, dynamic=true")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert_eq!(
+        status, 200,
+        "`dynamic=true` bypasses the store, so the state's declared 503 does not apply"
+    );
+
+    // And it did not advance: session d2 is still at its initial state.
+    let (state_status, _, _) = read(
+        hpx::Client::new()
+            .get(format!("{base}/gadgets/fragile-1"))
+            .header("Prefer", "scenario=fragile, session=d2")
+            .send()
+            .await?,
+    )
+    .await?;
+    assert_eq!(
+        state_status, 503,
+        "the bypassed request must not have moved the machine out of `healthy`"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_resource_read_back_is_byte_identical_to_the_one_written()
+-> Result<(), Box<dyn std::error::Error>> {
+    let Some(server) = boot(store_config()).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    for id in ["a", "b-2", "3", "with.dots", "UPPER", "%20escaped"] {
+        let payload = json!({"id": id, "name": format!("name for {id}")});
+        let (_, _, created) = read(
+            hpx::Client::new()
+                .post(format!("{base}/widgets"))
+                .header("Content-Type", "application/json")
+                .body(payload.to_string())
+                .send()
+                .await?,
+        )
+        .await?;
+
+        let (_, _, fetched) =
+            read(hpx::Client::new().get(format!("{base}/widgets/{id}")).send().await?).await?;
+
+        assert_eq!(
+            fetched, created,
+            "the store must return what it was given, unmodified, for id {id:?}"
+        );
+        assert_eq!(fetched, payload, "and that must equal what the client sent for {id:?}");
+    }
+
+    server.shutdown().await;
+    Ok(())
+}
