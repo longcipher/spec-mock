@@ -226,9 +226,23 @@ pub struct RunningServer {
     pub grpc_addr: Option<SocketAddr>,
     shutdown_tx: Option<oneshot::Sender<()>>,
     tasks: Vec<JoinHandle<()>>,
+    scenarios: Option<Arc<http::scenarios::ScenarioRuntime>>,
+    control_token: Option<String>,
 }
 
 impl RunningServer {
+    /// The scenario runtime, present only when a sidecar was supplied.
+    #[must_use]
+    pub fn scenarios(&self) -> Option<&http::scenarios::ScenarioRuntime> {
+        self.scenarios.as_deref()
+    }
+
+    /// Bearer token guarding the control endpoints, if they are enabled.
+    #[must_use]
+    pub fn control_token(&self) -> Option<&str> {
+        self.control_token.as_deref()
+    }
+
     /// Shut down runtime tasks gracefully.
     pub async fn shutdown(mut self) {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
@@ -287,6 +301,10 @@ pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> 
     let grpc_shutdown = Arc::new(tokio::sync::Notify::new());
 
     let http_runtime = http::HttpRuntime::from_config(&config).await?;
+    // Shared with the server task rather than copied. `scc`'s `Clone` snapshots
+    // the current entries into a new map, so a copy would be permanently
+    // disconnected from the sessions the handler is actually serving.
+    let scenarios = http_runtime.scenarios_handle();
     let (http_addr, http_task) =
         http::spawn_http_server(http_runtime, config.http_addr, Arc::clone(&http_shutdown)).await?;
 
@@ -311,7 +329,14 @@ pub async fn start(config: ServerConfig) -> Result<RunningServer, RuntimeError> 
         relay_grpc.notify_one();
     }));
 
-    Ok(RunningServer { http_addr, grpc_addr, shutdown_tx: Some(shutdown_tx), tasks })
+    Ok(RunningServer {
+        http_addr,
+        grpc_addr,
+        shutdown_tx: Some(shutdown_tx),
+        tasks,
+        scenarios,
+        control_token: config.control_token.clone(),
+    })
 }
 
 #[cfg(test)]

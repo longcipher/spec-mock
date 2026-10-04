@@ -260,9 +260,10 @@ fn seed_identifier(item: &Value, index: usize) -> String {
 
 /// Scenario execution for one running server.
 ///
-/// `Clone` is shallow: `scc` maps share their buckets, so every clone observes
-/// and mutates the same sessions.
-#[derive(Debug, Clone)]
+/// Held behind an `Arc` rather than cloned. `scc`'s `Clone` takes a *snapshot* of
+/// the current entries into a fresh map, so a clone would be a disconnected copy
+/// that never sees requests served through the original.
+#[derive(Debug)]
 pub struct ScenarioRuntime {
     sidecar: ValidatedSidecar,
     /// Catalogue keyed by request signature so lookup is a direct hit.

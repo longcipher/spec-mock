@@ -62,6 +62,28 @@ impl MockServer {
     pub async fn shutdown(self) {
         self.running.shutdown().await;
     }
+
+    /// Reset every live scenario instance to its initial state and empty its store.
+    ///
+    /// The two are reset together and are not separable: a caller able to clear
+    /// one without the other would find "reset" meaning two different things.
+    /// Returns the number of instances reset, or `None` when no sidecar is loaded.
+    pub fn reset_scenarios(&self) -> Option<usize> {
+        self.running.scenarios().map(specmock_runtime::http::scenarios::ScenarioRuntime::reset_all)
+    }
+
+    /// Current scenario and state for a session.
+    ///
+    /// Pass an empty string for the default instance.
+    pub fn scenario_state(&self, session: &str) -> Option<(String, String)> {
+        self.running.scenarios()?.session_state(session)
+    }
+
+    /// Bearer token guarding the control endpoints, if they are enabled.
+    #[must_use]
+    pub fn control_token(&self) -> Option<&str> {
+        self.running.control_token()
+    }
 }
 
 /// Process-mode server handle.
@@ -193,6 +215,40 @@ impl MockServerBuilder {
         self
     }
 
+    /// Set the scenario sidecar path.
+    ///
+    /// Cannot be combined with proxy mode: the upstream holds the real state.
+    #[must_use]
+    pub fn scenarios(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.scenarios_spec = Some(path.into());
+        self
+    }
+
+    /// Cap live scenario instances across all sessions.
+    #[must_use]
+    pub const fn max_sessions(mut self, max: usize) -> Self {
+        self.config.max_sessions = max;
+        self
+    }
+
+    /// Cap stored resources per scenario instance.
+    #[must_use]
+    pub const fn max_store_entries(mut self, max: usize) -> Self {
+        self.config.max_store_entries = max;
+        self
+    }
+
+    /// Enable the control endpoints with a freshly minted bearer token.
+    ///
+    /// They are the only mutating surface on the server, so they are guarded by
+    /// default. The read path stays unauthenticated, because a client has to be
+    /// able to call the mock with no ceremony.
+    #[must_use]
+    pub fn control_endpoints(mut self) -> Self {
+        self.config.control_token = Some(mint_control_token());
+        self
+    }
+
     /// Start in-process runtime, ideal for `#[tokio::test]`.
     pub async fn start(self) -> Result<MockServer, SdkError> {
         let ws_path = self.config.ws_path.clone();
@@ -267,6 +323,24 @@ impl MockServerBuilder {
             ws_path: self.config.ws_path,
         })
     }
+}
+
+/// Mint a bearer token for the control endpoints.
+///
+/// `RandomState` is seeded by the operating system, so consecutive runs differ
+/// without pulling in an RNG dependency. This is not a cryptographic token and
+/// is not meant to be: it exists so a shared machine's other users cannot reset
+/// someone's mock by accident, not to withstand an attacker.
+fn mint_control_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u64(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64),
+    );
+    format!("{:016x}", hasher.finish())
 }
 
 fn resolve_process_bind_addr(addr: SocketAddr) -> Result<SocketAddr, SdkError> {

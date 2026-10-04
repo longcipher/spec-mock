@@ -58,6 +58,58 @@ struct ServeArgs {
     /// Allow private/link-local/loopback upstream URLs in proxy mode.
     #[arg(long)]
     allow_private_upstream: bool,
+    /// Scenario sidecar declaring stateful behaviour.
+    ///
+    /// Resolved alongside the OpenAPI document rather than inside it, so a spec
+    /// owned by someone else can be mocked without being forked.
+    #[arg(long)]
+    scenarios: Option<std::path::PathBuf>,
+    /// Maximum live scenario instances across all sessions.
+    #[arg(long, default_value_t = specmock_sdk::DEFAULT_MAX_SESSIONS)]
+    max_sessions: usize,
+    /// Maximum stored resources per scenario instance.
+    #[arg(long, default_value_t = specmock_sdk::DEFAULT_MAX_STORE_ENTRIES)]
+    max_store_entries: usize,
+    /// Log verbosity.
+    ///
+    /// Scenario transitions log at `info`, because a state machine you cannot
+    /// observe is the main reason people give up on a mock and fall back to
+    /// something else.
+    #[arg(long, value_enum, default_value = "info")]
+    log_level: LogLevelArg,
+    /// Disable the control endpoints under `/_specmock/`.
+    ///
+    /// They are the only mutating surface on the server, so they are guarded by
+    /// a per-run bearer token unless this is passed.
+    #[arg(long)]
+    no_control_endpoints: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
+enum LogLevelArg {
+    /// Errors only.
+    Error,
+    /// Errors and warnings.
+    Warn,
+    /// Includes scenario transitions. The default.
+    #[default]
+    Info,
+    /// Verbose diagnostics.
+    Debug,
+    /// Everything, including per-request traces.
+    Trace,
+}
+
+impl LogLevelArg {
+    const fn into_level(self) -> tracing::Level {
+        match self {
+            Self::Error => tracing::Level::ERROR,
+            Self::Warn => tracing::Level::WARN,
+            Self::Info => tracing::Level::INFO,
+            Self::Debug => tracing::Level::DEBUG,
+            Self::Trace => tracing::Level::TRACE,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -78,9 +130,18 @@ impl ModeArg {
 
 #[tokio::main]
 async fn main() -> Result<(), eyre::Report> {
-    tracing_subscriber::fmt().with_target(false).with_level(true).compact().init();
-
     let cli = Cli::parse();
+
+    let level = match &cli.command {
+        Commands::Serve(args) => args.log_level.into_level(),
+    };
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_level(true)
+        .with_max_level(level)
+        .compact()
+        .init();
+
     match cli.command {
         Commands::Serve(args) => serve_command(args).await?,
     }
@@ -96,7 +157,9 @@ async fn serve_command(args: ServeArgs) -> Result<(), eyre::Report> {
         .grpc_addr(args.grpc_addr)
         .ws_path(args.ws_path)
         .max_body_size(args.max_body_size)
-        .allow_private_upstream(args.allow_private_upstream);
+        .allow_private_upstream(args.allow_private_upstream)
+        .max_sessions(args.max_sessions)
+        .max_store_entries(args.max_store_entries);
 
     if let Some(openapi) = args.openapi {
         builder = builder.openapi(openapi);
@@ -110,11 +173,23 @@ async fn serve_command(args: ServeArgs) -> Result<(), eyre::Report> {
     if let Some(upstream) = args.upstream {
         builder = builder.upstream(upstream);
     }
+    if let Some(scenarios) = args.scenarios {
+        builder = builder.scenarios(scenarios);
+    }
+    if !args.no_control_endpoints {
+        builder = builder.control_endpoints();
+    }
 
     let server = builder.start().await?;
     tracing::info!("HTTP: {}", server.http_base_url());
     if let Some(grpc_addr) = server.grpc_addr() {
         tracing::info!("gRPC: {grpc_addr}");
+    }
+    if let Some(control) = server.control_token() {
+        tracing::info!(
+            "control endpoints: {}/_specmock (bearer {control})",
+            server.http_base_url()
+        );
     }
     tracing::info!("Press Ctrl+C to stop");
 

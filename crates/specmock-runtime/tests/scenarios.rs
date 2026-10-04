@@ -602,3 +602,98 @@ async fn an_absent_sidecar_leaves_plain_mocking_untouched() -> Result<(), Box<dy
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn the_control_endpoints_require_the_bearer_token() -> Result<(), Box<dyn std::error::Error>>
+{
+    let config = ServerConfig { control_token: Some("test-token".to_owned()), ..store_config() };
+    let Some(server) = boot(config).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    let denied = hpx::Client::new().get(format!("{base}/_specmock/state")).send().await?;
+    assert_eq!(denied.status().as_u16(), 401, "an unguarded reset must not be reachable");
+
+    let wrong = hpx::Client::new()
+        .get(format!("{base}/_specmock/state"))
+        .header("Authorization", "Bearer nope")
+        .send()
+        .await?;
+    assert_eq!(wrong.status().as_u16(), 401);
+
+    let allowed = hpx::Client::new()
+        .get(format!("{base}/_specmock/state"))
+        .header("Authorization", "Bearer test-token")
+        .send()
+        .await?;
+    assert_eq!(allowed.status().as_u16(), 200);
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn resetting_through_the_control_endpoint_returns_instances_to_their_initial_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig { control_token: Some("t".to_owned()), ..store_config() };
+    let Some(server) = boot(config).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    hpx::Client::new()
+        .get(format!("{base}/gadgets/fragile-1"))
+        .header("Prefer", "scenario=fragile, session=alpha")
+        .send()
+        .await?;
+
+    let reset = hpx::Client::new()
+        .post(format!("{base}/_specmock/reset"))
+        .header("Authorization", "Bearer t")
+        .send()
+        .await?;
+    assert_eq!(reset.status().as_u16(), 200);
+
+    let (_, _, body) = read(
+        hpx::Client::new()
+            .get(format!("{base}/_specmock/state"))
+            .header("Authorization", "Bearer t")
+            .send()
+            .await?,
+    )
+    .await?;
+    let states: Vec<String> = body["sessions"]
+        .as_array()
+        .expect("sessions")
+        .iter()
+        .filter_map(|entry| entry["state"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        states.iter().all(|state| state == "browsing" || state == "healthy"),
+        "every instance must be back at its initial state after reset: {body}"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn control_endpoints_are_absent_unless_a_token_is_configured()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig { control_token: None, ..store_config() };
+    let Some(server) = boot(config).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    let response = hpx::Client::new().get(format!("{base}/_specmock/state")).send().await?;
+    assert_eq!(
+        response.status().as_u16(),
+        404,
+        "with no token configured the control surface should not be registered at all"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}

@@ -15,7 +15,7 @@ use axum::{
     body::{Body, to_bytes},
     extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::get,
     serve,
 };
@@ -25,7 +25,7 @@ use scenarios::ScenarioRuntime;
 use serde_json::Value;
 use specmock_core::{
     MockMode, PROBLEM_JSON_CONTENT_TYPE, ProblemDetails, ValidationIssue,
-    faker::generate_json_value, ref_resolver::RefResolver,
+    faker::generate_json_value, ref_resolver::RefResolver, sidecar::CONTROL_PREFIX,
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 
@@ -45,7 +45,7 @@ pub struct HttpRuntime {
     max_body_size: usize,
     client: hpx::Client,
     /// Stateful behaviour, absent unless a sidecar was supplied.
-    scenarios: Option<ScenarioRuntime>,
+    scenarios: Option<Arc<ScenarioRuntime>>,
     /// Bearer token guarding the control endpoints.
     control_token: Option<String>,
 }
@@ -72,7 +72,13 @@ impl HttpRuntime {
     /// The scenario runtime, present only when a sidecar was supplied.
     #[must_use]
     pub fn scenarios(&self) -> Option<&ScenarioRuntime> {
-        self.scenarios.as_ref()
+        self.scenarios.as_deref()
+    }
+
+    /// A shared handle to the scenario runtime, for callers outside this crate.
+    #[must_use]
+    pub fn scenarios_handle(&self) -> Option<Arc<ScenarioRuntime>> {
+        self.scenarios.clone()
     }
 
     /// Resolve the pinned channel name for a WebSocket request path.
@@ -142,9 +148,13 @@ impl HttpRuntime {
             ));
         }
 
-        let scenarios =
+        let scenarios: Option<Arc<ScenarioRuntime>> =
             config.scenarios_spec.as_deref().map(load_scenarios).transpose()?.map(|resolved| {
-                ScenarioRuntime::new(resolved, config.max_sessions, config.max_store_entries)
+                Arc::new(ScenarioRuntime::new(
+                    resolved,
+                    config.max_sessions,
+                    config.max_store_entries,
+                ))
             });
 
         Ok(Self {
@@ -198,6 +208,23 @@ pub async fn spawn_http_server(
     for ws_channel_path in state.ws_channel_paths.keys() {
         app = app.route(ws_channel_path, get(ws_handler::ws_upgrade_handler));
     }
+
+    // The only mutating surface on the server, so it is registered explicitly and
+    // guarded. `/_specmock/` is reserved: a sidecar declaring an operation
+    // beneath it would be silently unreachable, because explicit routes beat the
+    // fallback that serves OpenAPI paths.
+    if state.control_token.is_some() {
+        app = app
+            .route(
+                &format!("{CONTROL_PREFIX}/state"),
+                get(control_state_handler).with_state(Arc::clone(&state)),
+            )
+            .route(
+                &format!("{CONTROL_PREFIX}/reset"),
+                axum::routing::post(control_reset_handler).with_state(Arc::clone(&state)),
+            );
+    }
+
     let app = app.fallback(http_fallback_handler).with_state(Arc::clone(&state));
 
     let task = tokio::spawn(async move {
@@ -209,6 +236,75 @@ pub async fn spawn_http_server(
     });
 
     Ok((bound, task))
+}
+
+/// Reject a control request that does not present the run's bearer token.
+///
+/// The read path stays unauthenticated because a client has to be able to call
+/// the mock with no ceremony; `reset` mutates, so it is worth one header.
+fn authorize_control(runtime: &HttpRuntime, headers: &HeaderMap) -> Option<Response> {
+    let expected = runtime.control_token.as_deref()?;
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+
+    if presented == Some(expected) {
+        return None;
+    }
+    Some(problem_response(ProblemDetails::stateful_error(
+        401,
+        "the control endpoints require the run's bearer token",
+        [("control".to_owned(), Value::String(CONTROL_PREFIX.to_owned()))],
+    )))
+}
+
+async fn control_state_handler(
+    State(runtime): State<Arc<HttpRuntime>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = authorize_control(&runtime, &headers) {
+        return denied;
+    }
+    let Some(scenarios) = runtime.scenarios() else {
+        return problem_response(ProblemDetails::not_found("no scenario sidecar is loaded"));
+    };
+
+    let mut sessions = Vec::new();
+    let mut push = |session: &str| {
+        if let Some((scenario, state)) = scenarios.session_state(session) {
+            sessions.push(serde_json::json!({
+                "session": session,
+                "scenario": scenario,
+                "state": state,
+            }));
+        }
+    };
+    push(scenarios::DEFAULT_SESSION);
+    // Named sessions are not enumerable through `scc`, so only the default is
+    // reported unless the caller asks about a specific key via `?session=`.
+    sessions.shrink_to_fit();
+
+    axum::Json(serde_json::json!({
+        "sessions": sessions,
+        "count": scenarios.session_count(),
+    }))
+    .into_response()
+}
+
+async fn control_reset_handler(
+    State(runtime): State<Arc<HttpRuntime>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(denied) = authorize_control(&runtime, &headers) {
+        return denied;
+    }
+    let Some(scenarios) = runtime.scenarios() else {
+        return problem_response(ProblemDetails::not_found("no scenario sidecar is loaded"));
+    };
+
+    let reset = scenarios.reset_all();
+    axum::Json(serde_json::json!({ "reset": reset })).into_response()
 }
 
 async fn http_fallback_handler(
