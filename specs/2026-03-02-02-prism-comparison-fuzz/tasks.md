@@ -3,7 +3,19 @@
 | Metadata | Details |
 | :--- | :--- |
 | **Design Doc** | specs/2026-03-02-02-prism-comparison-fuzz/design.md |
-| **Status** | Planning |
+| **Status** | Planning (checkboxes unreliable — see below) |
+
+> **The checkboxes in this file understate what shipped.** Audited 2026-10-04: Phases 2–5
+> and the entire Definition of Done are unticked, yet `tests/harness/fuzzer.rs` (25 KB,
+> `OpenApiFuzzer` with request generation for paths, query, and bodies),
+> `tests/harness/comparator.rs` (17 KB, `compare_responses` covering status, content type,
+> JSON structure, and RFC 7807), and `prism_comparison.rs` (11 tests, all `#[ignore]` pending
+> a local Prism install) are fully written.
+>
+> They were left unticked rather than corrected in bulk because this audit verified the
+> harness modules exist and are substantial, not that each of the 75 boxes corresponds to
+> shipped behaviour. Retick per task only with test evidence. See the "Spec artifact
+> reliability" section in `specs/README.md`.
 
 ## Summary & Timeline
 

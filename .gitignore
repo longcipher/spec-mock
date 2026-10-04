@@ -1,6 +1,8 @@
 # Rust
 /target/
-Cargo.lock
+
+# `Cargo.lock` is intentionally tracked: this workspace ships the `spec-mock`
+# binary, so a reproducible build needs the resolved dependency set.
 
 # Coverage
 *.profraw

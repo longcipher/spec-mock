@@ -37,7 +37,7 @@ This design overhauls every layer of spec-mock to achieve full Prism feature par
 | F16 | Request body Content-Type validation with 415 response | Medium |
 | F17 | Proxy mode: correct `Host` header forwarding to upstream | Medium |
 | F18 | HTTP request body size limit (configurable, default 10 MiB) | Medium |
-| F19 | Efficient path matching using radix tree | Medium |
+| F19 | Efficient path matching using segment trie | Medium |
 | F20 | Callback / Webhook endpoint support (outbound mock calls) | Low |
 | F21 | Migrate from deprecated `serde_yaml` to `serde_yml` | Medium |
 | F22 | Remove `common` crate template residue or repurpose | Low |
@@ -117,7 +117,7 @@ This design overhauls every layer of spec-mock to achieve full Prism feature par
 
 3. **Error model is RFC 7807.** All HTTP error responses use `application/problem+json` with `type`, `title`, `status`, `detail`, and an `errors` extension array of `ValidationIssue`. The gRPC error model remains `google.rpc.Status` + `BadRequest` details.
 
-4. **Router uses a radix tree.** Path templates are compiled into a trie at spec load time. Matching is O(depth) where depth = number of path segments.
+4. **Router uses a segment trie.** Path templates are compiled into a trie at spec load time. Matching is O(depth) where depth = number of path segments.
 
 5. **Content negotiation and `Prefer` header are handled as middleware/extractors** before the mock response is generated, so operation handlers always know the target status code and media type.
 
@@ -273,22 +273,22 @@ pub struct ProblemDetails {
 
 ### 4.5 Module: `specmock-runtime/src/http/router.rs` (NEW)
 
-Radix-tree based path router:
+Segment-trie based path router:
 
 ```rust
 /// Compiled route index for O(log n) path matching.
 pub struct PathRouter {
-    root: RadixNode,
+    root: RouteNode,
 }
 
-struct RadixNode {
-    children: Vec<RadixEdge>,
+struct RouteNode {
+    children: Vec<RouteEdge>,
     operations: Vec<(Method, usize)>, // method -> operation index
 }
 
-struct RadixEdge {
+struct RouteEdge {
     segment: SegmentMatcher,
-    child: RadixNode,
+    child: RouteNode,
 }
 
 enum SegmentMatcher {
@@ -469,7 +469,7 @@ struct ServeArgs {
 | `faker` (format) | All format strings pass validation |
 | `faker` (discriminator) | Polymorphic schemas generate valid discriminator values |
 | `faker` (default) | Default values used when no example exists |
-| `router` | Radix tree matches literal, param, and ambiguous paths correctly |
+| `router` | Segment trie matches literal, param, and ambiguous paths correctly |
 | `negotiate` | `Prefer` header parsing; `Accept` content negotiation |
 | `error` (RFC 7807) | Serialization matches RFC 7807 structure |
 

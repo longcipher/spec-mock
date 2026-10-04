@@ -51,14 +51,16 @@ It supports standalone CLI usage and native Rust SDK embedding for `#[tokio::tes
 - Content negotiation via the `Accept` header across every declared media type; an
   unsatisfiable `Accept` returns `406`. Without `Accept`, the JSON family is preferred.
 - Response body encoding per media type: compact JSON, XML (with schema-derived root
-  element), raw text, and raw binary payloads.
+  element), and — for `text/*` and binary types alike — a string value emitted verbatim,
+  `null` as an empty body, and any other value as its JSON form.
 - Declared response headers are emitted, using `example` when present and the faker otherwise.
 - Faker supports: `pattern` (regex), all standard `format` values, seeded `enum` and
   `oneOf`/`anyOf` variant selection, `discriminator` + `mapping`, `additionalProperties`,
   `default` values.
 - Proxy mode for HTTP: forwards upstream response and validates it against OpenAPI response schema.
 - `Prefer` header: select response by status code, named example, or force dynamic generation.
-- Multi-value query parameters with `style`/`explode` support.
+- Multi-value query parameters: repeated keys are collected and validated against the `items`
+  subschema. OpenAPI serialization (`style`/`explode`) is **not** implemented.
 - Callback/webhook firing on matched operations (fire-and-forget).
 - Configurable request body size limit (default 10 MiB, 413 on exceeded).
 - Content-Type validation returns 415 for media types the operation does not declare.
@@ -205,7 +207,10 @@ Input envelope options:
 
 ### 3. Protobuf gRPC mock server
 
-Uses tonic for standard HTTP/2 transport with proper trailers. Supports unary and server-streaming RPCs.
+Serves HTTP/2 over `hyper-util` with hand-rolled gRPC framing and trailers; `tonic` is used
+only for its `Status` type, not its transport. Supports unary and server-streaming RPCs.
+Client-streaming, bidi-streaming, and server reflection are **not** supported — `grpcurl`
+requires an explicit `-proto`.
 
 ```bash
 cargo run -p spec-mock -- serve \

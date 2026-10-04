@@ -3,7 +3,19 @@
 | Metadata | Details |
 | :--- | :--- |
 | **Design Doc** | specs/2026-03-02-01-prism-parity-overhaul/design.md |
-| **Status** | Complete |
+| **Status** | Complete, with three exceptions annotated inline (audited 2026-10-04) |
+
+> Most of this list did ship. Three items did not, and were ticked in error; each is now
+> annotated at the point of the claim rather than left to mislead:
+>
+> - Task 4.1 Step 2 — `grpc/tonic_dynamic.rs` was never created. `grpc/protobuf.rs` was kept
+>   and retooled on `hyper_util` instead.
+> - Task 4.1 Step 9 — nothing re-exports from `tonic_dynamic`, because it does not exist.
+> - Definition of Done — URL-based `$ref` does not resolve; `RefResolver` rejects it outright.
+>
+> Task 4.3 Step 5 (WS/OpenAPI path conflict detection) was also ticked in error, but has since
+> actually been implemented; see the annotation there. See the "Spec artifact reliability"
+> section in `specs/README.md`.
 
 ## Summary & Timeline
 
@@ -178,12 +190,12 @@
 
 ## Phase 3: HTTP Runtime Overhaul
 
-### Task 3.1: Implement Radix-Tree Path Router
+### Task 3.1: Implement Segment-Trie Path Router
 
-> **Context:** Current `match_operation` does linear scan over all operations. Replace with a radix-tree built at spec load time. The router is used by `http_fallback_handler` to find the matched operation.
+> **Context:** Current `match_operation` does linear scan over all operations. Replace with a segment-trie built at spec load time. The router is used by `http_fallback_handler` to find the matched operation.
 > **Verification:** Router correctly matches literal, parameter, and edge-case paths. Performance is O(depth).
 
-- [x] Step 1: Create `crates/specmock-runtime/src/http/router.rs` with `PathRouter`, `RadixNode`, `RadixEdge`, `SegmentMatcher`, `RouteMatch` types
+- [x] Step 1: Create `crates/specmock-runtime/src/http/router.rs` with `PathRouter`, `RouteNode`, `RouteEdge`, `SegmentMatcher`, `RouteMatch` types
 - [x] Step 2: Implement `PathRouter::build(operations: &[OperationSpec]) -> Self`:
   - Split each path template into segments
   - Insert segments into the trie
@@ -300,7 +312,10 @@
   - `tokio-stream = "0.1"` (for streaming)
   - `tower = "0.5"` (service traits)
   - Keep `prost`, `prost-reflect`, `protox`
-- [x] Step 2: Create `crates/specmock-runtime/src/grpc/tonic_dynamic.rs`
+- [x] Step 2: ~~Create `crates/specmock-runtime/src/grpc/tonic_dynamic.rs`~~
+  **Not done as written.** The file was never created; `grpc/protobuf.rs` was kept and
+  retooled instead, serving HTTP/2 through `hyper_util::server::conn::auto` with hand-rolled
+  gRPC framing and trailers. `tonic` is used only for its `Status` type. Verified 2026-10-04.
 - [x] Step 3: Implement `DynamicGrpcService` struct with:
   - `DescriptorPool` and `HashMap<String, MethodDescriptor>` (same as current)
   - Seed for faker
@@ -321,7 +336,9 @@
   - `grpc-status-details-bin` in trailers with `google.rpc.Status` proto
 - [x] Step 7: Keep existing `GoogleRpcStatus`, `GoogleRpcBadRequest` prost-derived types for error encoding
 - [x] Step 8: Remove old `crates/specmock-runtime/src/grpc/protobuf.rs`
-- [x] Step 9: Update `crates/specmock-runtime/src/grpc/mod.rs` to re-export from `tonic_dynamic`
+- [x] Step 9: ~~Update `crates/specmock-runtime/src/grpc/mod.rs` to re-export from `tonic_dynamic`~~
+  **Not applicable.** `tonic_dynamic` was never created, so there is nothing to re-export.
+  `grpc/mod.rs` re-exports from `grpc/protobuf.rs`. Verified 2026-10-04.
 - [x] Step 10: Update gRPC integration tests to use `tonic::transport::Channel` client instead of raw hpx HTTP/1.1 calls
 - [x] Step 11: Add streaming test with `greeter-streaming.proto`:
 
@@ -377,6 +394,10 @@
 - [x] Step 3: Register multiple WS routes in the axum Router (iterate over paths without `Box::leak`)
 - [x] Step 4: In `ws_socket_loop`, if connected to a specific channel path, auto-route messages to that channel
 - [x] Step 5: Add conflict detection between WS paths and OpenAPI paths at startup
+  Implemented 2026-10-04, long after this box was first ticked. `OpenApiRuntime::shadowed_path`
+  reuses the path router to detect a declared `GET` operation beneath a WebSocket route, and
+  `HttpRuntime::from_config` fails startup naming both paths. Covered by three tests in
+  `e2e_full_stack.rs`. The same check now also guards the reserved `/_specmock/` prefix.
 - [x] Step 6: Write integration test: connect to `/ws/chat.send`, send payload without channel envelope, expect it routes to `chat.send`
 - [x] Verification: `cargo test -p specmock-runtime --test ws_asyncapi` — all tests pass
 
@@ -459,8 +480,13 @@
 
 ## Definition of Done
 
-- [x] All `$ref` types (local, file, URL) resolve correctly
+- [ ] All `$ref` types (local, file, URL) resolve correctly
+  **Partially met, and previously ticked in error.** Local and file-relative refs resolve.
+  URL refs do not exist: `RefResolver` rejects `http://` and `https://` with
+  "URL-based $ref is not supported". Verified 2026-10-04.
 - [x] gRPC server uses tonic with HTTP/2 and proper trailers
+  **Met differently than described.** HTTP/2 and trailers work, but through
+  `hyper_util::server::conn::auto` with hand-rolled framing, not `tonic`'s transport.
 - [x] gRPC streaming (at least server-streaming) works
 - [x] Faker handles `pattern`, all standard `format` values, `discriminator`, `additionalProperties`, `default`
 - [x] AsyncAPI v2 and v3 specs both parse and serve correctly

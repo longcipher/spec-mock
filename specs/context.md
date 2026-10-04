@@ -52,7 +52,9 @@ Additional tooling:
 - **Integration Tests:** `crates/specmock-runtime/tests/{http_openapi,ws_asyncapi,grpc_protobuf,prism_comparison}.rs`
 - **SDK Tests:** `crates/specmock-sdk/tests/{sdk_embed,sdk_process}.rs`
 - **Test Harness:** `crates/specmock-runtime/tests/harness/{mod,fuzzer,comparator,prism,request}.rs`
-- **Total:** 223 passing tests, 11 ignored (integration tests requiring Prism)
+- **Total:** 747 passing tests, 11 ignored (integration tests requiring Prism). Counted from
+  `cargo test --all-features` on 2026-10-04; recompute rather than trusting this line, as it
+  previously sat at a stale 223.
 
 ## Git History Signal
 
@@ -62,7 +64,7 @@ Additional tooling:
 
 ## Architectural Decisions (Existing)
 
-- **Radix-tree router:** Custom `PathRouter` for O(depth) path matching instead of linear scan
+- **Segment-trie router:** Custom `PathRouter` for O(depth) path matching instead of linear scan
 - **Deterministic faker:** Seeded ChaCha8Rng for reproducible mock data generation
 - **$ref resolver:** Supports local JSON pointer and file-relative refs with allowed-root sandboxing and LRU cache
 - **RFC 7807 errors:** All error responses use `application/problem+json` format
