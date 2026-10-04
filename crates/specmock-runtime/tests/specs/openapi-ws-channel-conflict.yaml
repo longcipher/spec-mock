@@ -1,0 +1,20 @@
+openapi: 3.1.0
+info:
+  title: WebSocket Channel Path Conflict
+  version: "1.0.0"
+paths:
+  /ws/{name}:
+    get:
+      operationId: getWsNamed
+      responses:
+        "200":
+          description: >-
+            Declares only the templated path, so the WebSocket base path itself
+            does not collide; a per-channel path such as /ws/chat.send does.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean

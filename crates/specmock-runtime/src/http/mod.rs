@@ -99,6 +99,24 @@ impl HttpRuntime {
             })
             .unwrap_or_default();
 
+        // The WebSocket base path is registered as an explicit axum route even
+        // when no AsyncAPI document is supplied, and explicit routes always beat
+        // the fallback that serves OpenAPI paths. Report the collision instead
+        // of silently making the declared operation unreachable.
+        if let Some(openapi) = openapi.as_ref() {
+            let ws_routes = std::iter::once(config.ws_path.as_str())
+                .chain(ws_channel_paths.keys().map(String::as_str));
+            for ws_route in ws_routes {
+                if let Some(template) = openapi.shadowed_path(ws_route) {
+                    return Err(RuntimeError::Config(format!(
+                        "OpenAPI path '{template}' collides with the WebSocket route '{ws_route}'. \
+                         WebSocket routes take precedence, so that operation would be unreachable. \
+                         Re-run with a different --ws-path."
+                    )));
+                }
+            }
+        }
+
         Ok(Self {
             openapi,
             asyncapi,
@@ -221,7 +239,7 @@ async fn http_fallback_handler(
 
     let prefer = PreferDirectives::from_headers(&headers);
     let seed = crate::deterministic_hash(runtime.seed, &format!("{method}{path}"));
-    let mock_response = match matched.operation.mock_response(seed, &prefer) {
+    let mut mock_response = match matched.operation.mock_response(seed, &prefer) {
         Ok(mock_response) => mock_response,
         Err(RuntimeError::NotFound(message)) => {
             return problem_response(ProblemDetails::not_found(&message));
@@ -241,6 +259,14 @@ async fn http_fallback_handler(
             );
         }
     };
+
+    // `Location` must name a resource on *this* server, so it is derived from
+    // the request rather than from a spec example or the faker.
+    openapi::render_location_header(
+        &mut mock_response.headers,
+        &matched.operation.path_template,
+        &matched.path_params,
+    );
 
     let response = build_mock_response(&mock_response);
 

@@ -1,0 +1,31 @@
+openapi: 3.1.0
+info:
+  title: WebSocket Path Conflict
+  version: "1.0.0"
+paths:
+  /ws:
+    get:
+      operationId: getWs
+      responses:
+        "200":
+          description: Declares a path that collides with the default WebSocket base path.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+  /ws/{name}:
+    get:
+      operationId: getWsNamed
+      responses:
+        "200":
+          description: Declares a path that collides with a per-channel WebSocket path.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean

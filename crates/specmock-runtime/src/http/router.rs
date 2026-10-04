@@ -1,4 +1,4 @@
-//! Radix-tree based path router built at spec load time.
+//! Segment-trie based path router built at spec load time.
 //!
 //! Replaces the previous linear-scan `match_operation` approach with an
 //! O(depth) lookup over a tree of path segments.
@@ -13,10 +13,10 @@ use super::openapi::OperationSpec;
 // Public types
 // ---------------------------------------------------------------------------
 
-/// Pre-compiled radix-tree router for HTTP path matching.
+/// Pre-compiled segment-trie router for HTTP path matching.
 #[derive(Debug, Clone)]
 pub struct PathRouter {
-    root: RadixNode,
+    root: RouteNode,
 }
 
 /// Result of a successful route match.
@@ -41,20 +41,20 @@ pub enum SegmentMatcher {
 // Private types
 // ---------------------------------------------------------------------------
 
-/// A node in the radix tree.
+/// A node in the segment trie.
 #[derive(Debug, Clone, Default)]
-struct RadixNode {
+struct RouteNode {
     /// Outgoing edges to child nodes.
-    children: Vec<RadixEdge>,
+    children: Vec<RouteEdge>,
     /// Operations that terminate at this node: `(Method, operation_index)`.
     operations: Vec<(Method, usize)>,
 }
 
-/// An edge connecting two `RadixNode`s via a `SegmentMatcher`.
+/// An edge connecting two `RouteNode`s via a `SegmentMatcher`.
 #[derive(Debug, Clone)]
-struct RadixEdge {
+struct RouteEdge {
     segment: SegmentMatcher,
-    child: RadixNode,
+    child: RouteNode,
 }
 
 // ---------------------------------------------------------------------------
@@ -68,7 +68,7 @@ impl PathRouter {
     /// into the tree. Lookup time is O(number of segments in the request
     /// path).
     pub fn build(operations: &[OperationSpec]) -> Self {
-        let mut root = RadixNode::default();
+        let mut root = RouteNode::default();
 
         for (index, operation) in operations.iter().enumerate() {
             let segments = parse_segments(&operation.path_template);
@@ -122,7 +122,7 @@ fn split_path(path: &str) -> Vec<&str> {
 // Helpers — tree insertion
 // ---------------------------------------------------------------------------
 
-fn insert(node: &mut RadixNode, segments: &[SegmentMatcher], method: Method, index: usize) {
+fn insert(node: &mut RouteNode, segments: &[SegmentMatcher], method: Method, index: usize) {
     if segments.is_empty() {
         node.operations.push((method, index));
         return;
@@ -141,9 +141,9 @@ fn insert(node: &mut RadixNode, segments: &[SegmentMatcher], method: Method, ind
     }
 
     // No existing edge — create a new one.
-    let mut child = RadixNode::default();
+    let mut child = RouteNode::default();
     insert(&mut child, tail, method, index);
-    node.children.push(RadixEdge { segment: head.clone(), child });
+    node.children.push(RouteEdge { segment: head.clone(), child });
 }
 
 // ---------------------------------------------------------------------------
@@ -152,19 +152,19 @@ fn insert(node: &mut RadixNode, segments: &[SegmentMatcher], method: Method, ind
 
 /// Recursively walk the tree and collect path parameters.
 ///
-/// Returns the terminal `RadixNode` only when that node declares an operation
+/// Returns the terminal `RouteNode` only when that node declares an operation
 /// for `method`. The method is threaded through the walk because two templates
 /// can share a shape yet differ in parameter name (`/{a}` and `/{b}` become
 /// separate edges); without this, the first such edge would swallow the request
 /// and a method declared only on a sibling edge would be unreachable.
 ///
-/// Returns the terminal `RadixNode` if the walk succeeds.
+/// Returns the terminal `RouteNode` if the walk succeeds.
 fn walk<'a>(
-    node: &'a RadixNode,
+    node: &'a RouteNode,
     segments: &[&str],
     params: &mut HashMap<String, String>,
     method: &Method,
-) -> Option<&'a RadixNode> {
+) -> Option<&'a RouteNode> {
     if segments.is_empty() {
         return node.operations.iter().any(|(m, _)| m == method).then_some(node);
     }

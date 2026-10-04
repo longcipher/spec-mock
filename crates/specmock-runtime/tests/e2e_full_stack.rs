@@ -724,3 +724,65 @@ async fn malformed_spec_files_are_reported_with_a_parse_error()
 
     Ok(())
 }
+
+#[tokio::test]
+async fn a_spec_path_colliding_with_the_websocket_base_path_fails_startup()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `openapi-ws-conflict.yaml` declares `GET /ws`, which is the default
+    // WebSocket base path. WebSocket paths are explicit axum routes and
+    // OpenAPI paths are served by the fallback, so without a startup check the
+    // declared operation silently becomes unreachable.
+    let config =
+        ServerConfig { openapi_spec: Some(spec("openapi-ws-conflict.yaml")), ..base_config() };
+
+    let error = start(config).await.err().ok_or("startup should fail")?;
+    let message = error.to_string();
+    assert!(message.contains("/ws"), "the error must name the colliding path: {message}");
+    assert!(
+        message.contains("WebSocket"),
+        "the error must name the colliding route family: {message}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_spec_path_colliding_with_a_websocket_channel_path_fails_startup()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `openapi-ws-channel-conflict.yaml` declares only the template
+    // `/ws/{name}`, so the WebSocket base path `/ws` is clear but the AsyncAPI
+    // channel `chat.send` at `/ws/chat.send` is not.
+    let config = ServerConfig {
+        openapi_spec: Some(spec("openapi-ws-channel-conflict.yaml")),
+        asyncapi_spec: Some(spec("asyncapi-chat.yaml")),
+        ..base_config()
+    };
+
+    let error = start(config).await.err().ok_or("startup should fail")?;
+    let message = error.to_string();
+    assert!(
+        message.contains("/ws/{name}") && message.contains("/ws/chat.send"),
+        "the error must name both the declared template and the colliding channel path: {message}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_colliding_websocket_base_path_still_starts() -> Result<(), Box<dyn std::error::Error>>
+{
+    // A base path that matches neither declared route leaves startup working.
+    let config = ServerConfig {
+        openapi_spec: Some(spec("openapi-ws-conflict.yaml")),
+        asyncapi_spec: Some(spec("asyncapi-chat.yaml")),
+        ws_path: "/events".to_owned(),
+        ..base_config()
+    };
+
+    let server = boot(config).await?;
+    if let Some(server) = server {
+        server.shutdown().await;
+    }
+
+    Ok(())
+}

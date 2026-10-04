@@ -112,6 +112,9 @@ pub fn encode_body(media_type: &str, value: &Value, schema: Option<&Value>) -> V
         let root = xml_root_name(schema);
         return json_to_xml(&root, value).into_bytes();
     }
+    // `text` and `binary` share one path: a string value is emitted verbatim,
+    // which is how a spec supplies opaque content. `null` is an empty body and
+    // any other value falls back to its JSON form.
     match value {
         Value::String(text) => text.clone().into_bytes(),
         Value::Null => Vec::new(),

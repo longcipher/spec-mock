@@ -1,0 +1,66 @@
+openapi: 3.1.0
+info:
+  title: Location Header
+  version: "1.0.0"
+paths:
+  /widgets/{id}:
+    post:
+      operationId: createWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "201":
+          description: Created. Declares `Location` with no example.
+          headers:
+            Location:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: string
+  /gadgets:
+    post:
+      operationId: createGadget
+      responses:
+        "201":
+          description: Created. Declares `Location` with a placeholder example.
+          headers:
+            Location:
+              example: https://api.example.com/gadgets/1
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: string
+  /sprockets/{id}:
+    post:
+      operationId: createSprocket
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "201":
+          description: Created. Declares `Location` as a string type.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id]
+                properties:
+                  id:
+                    type: string

@@ -11,7 +11,17 @@ pub const PROBLEM_JSON_CONTENT_TYPE: &str = "application/problem+json";
 pub struct ValidationIssue {
     /// JSON pointer into instance payload.
     pub instance_pointer: String,
-    /// JSON pointer into schema.
+    /// JSON pointer to the rule that was violated.
+    ///
+    /// Two pointer spaces share this field, distinguished by the leading `#`:
+    ///
+    /// - *Schema* pointers are bare and address a keyword inside the subschema that failed, such
+    ///   as `/minimum` or `/properties/name/minLength`.
+    /// - *Specification* pointers are `#`-prefixed and address the position in the OpenAPI or
+    ///   AsyncAPI document itself, such as `#/requestBody` or `#/channels/{name}`. These mark
+    ///   where in the contract the failure originates, not which schema keyword rejected a value.
+    ///
+    /// A bare `#` means the failure concerns the document as a whole.
     pub schema_pointer: String,
     /// Best-effort keyword.
     pub keyword: String,

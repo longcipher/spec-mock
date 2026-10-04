@@ -301,6 +301,22 @@ impl OpenApiRuntime {
         let RouteMatch { operation_index, path_params } = self.router.match_route(method, path)?;
         Some(MatchedOperation { operation: &self.operations[operation_index], path_params })
     }
+
+    /// Returns the path template that a concrete route path would shadow.
+    ///
+    /// WebSocket paths are registered as explicit axum routes while OpenAPI
+    /// paths are served by the router fallback, so an explicit route always
+    /// wins. A declared operation beneath a WebSocket path is therefore
+    /// unreachable rather than merely ambiguous. WebSocket upgrades are `GET`
+    /// requests, so only `GET` operations can be shadowed.
+    ///
+    /// This exists so the collision can be reported at startup instead of
+    /// silently swallowing the operation at request time.
+    pub fn shadowed_path(&self, concrete_path: &str) -> Option<&str> {
+        let RouteMatch { operation_index, .. } =
+            self.router.match_route(&Method::GET, concrete_path)?;
+        self.operations.get(operation_index).map(|operation| operation.path_template.as_str())
+    }
 }
 
 impl OperationSpec {
@@ -584,6 +600,60 @@ fn header_value_to_string(value: &Value) -> String {
         Value::Null => String::new(),
         other => other.to_string(),
     }
+}
+
+/// Re-render a declared `Location` header from the matched request path.
+///
+/// `Location` identifies the resource a request created, so in a mock it has to
+/// come from the request. The two obvious alternatives are both wrong: a spec
+/// `example` points at the spec author's own server, and a faker-generated
+/// value is noise that merely resembles a URL. Either sends the client to a
+/// resource that does not exist here, and a wrong `Location` is worse than an
+/// absent one because it looks authoritative.
+///
+/// A `Location` the operation never declared is not added — inventing the
+/// header would be a stronger claim than echoing it.
+pub fn render_location_header(
+    headers: &mut [(String, String)],
+    path_template: &str,
+    path_params: &HashMap<String, String>,
+) {
+    for (name, value) in headers.iter_mut() {
+        if name.eq_ignore_ascii_case("location") {
+            *value = substitute_path_params(path_template, path_params);
+        }
+    }
+}
+
+/// Substitute `{name}` placeholders in a path template with bound values.
+///
+/// An unbound placeholder is left verbatim rather than dropped, so a template
+/// the router could not satisfy stays visible instead of silently collapsing
+/// into a shorter, plausible-looking path.
+fn substitute_path_params(template: &str, params: &HashMap<String, String>) -> String {
+    let mut rendered = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(open) = rest.find('{') {
+        rendered.push_str(&rest[..open]);
+        let Some(offset) = rest[open..].find('}') else {
+            rendered.push_str(&rest[open..]);
+            return rendered;
+        };
+        let name = &rest[open + 1..open + offset];
+        match params.get(name) {
+            Some(value) => rendered.push_str(value),
+            None => {
+                rendered.push('{');
+                rendered.push_str(name);
+                rendered.push('}');
+            }
+        }
+        rest = &rest[open + offset + 1..];
+    }
+
+    rendered.push_str(rest);
+    rendered
 }
 
 fn parse_parameters(

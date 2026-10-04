@@ -31,6 +31,101 @@ fn openapi_array_params_spec_path() -> PathBuf {
         .join("openapi-array-params.yaml")
 }
 
+fn openapi_location_spec_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("specs")
+        .join("openapi-location-header.yaml")
+}
+
+/// Boot a server for the given spec, tolerating sandboxes that forbid binding.
+async fn boot(
+    spec: PathBuf,
+) -> Result<Option<specmock_runtime::RunningServer>, Box<dyn std::error::Error>> {
+    let config = ServerConfig {
+        openapi_spec: Some(spec),
+        mode: MockMode::Mock,
+        http_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+        ..ServerConfig::default()
+    };
+    match start(config).await {
+        Ok(server) => Ok(Some(server)),
+        Err(RuntimeError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            Ok(None)
+        }
+        Err(error) => Err(error.to_string().into()),
+    }
+}
+
+#[tokio::test]
+async fn a_declared_location_header_reflects_the_request_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A `Location` header generated from the faker would be a random string that
+    // looks like a URL but resolves to nothing. It must come from the request.
+    let Some(server) = boot(openapi_location_spec_path()).await? else {
+        return Ok(());
+    };
+
+    let response = hpx::post(format!("http://{}/widgets/42", server.http_addr)).send().await?;
+    assert_eq!(response.status().as_u16(), 201);
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or("a declared Location header must be emitted")?;
+
+    assert_eq!(location, "/widgets/42", "Location must reflect the concrete request path");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_declared_location_example_does_not_leak_the_spec_authors_host()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The declared example points at the spec author's own server. In a mock the
+    // only host that knows the resource is the mock itself.
+    let Some(server) = boot(openapi_location_spec_path()).await? else {
+        return Ok(());
+    };
+
+    let response = hpx::post(format!("http://{}/gadgets", server.http_addr)).send().await?;
+    let location = response
+        .headers()
+        .get("location")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or("a declared Location header must be emitted")?;
+
+    assert!(
+        !location.contains("api.example.com"),
+        "Location must not point at the spec author's host: {location}"
+    );
+    assert_eq!(location, "/gadgets");
+
+    server.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_undeclared_location_header_is_not_invented() -> Result<(), Box<dyn std::error::Error>> {
+    // `/sprockets/{id}` declares no Location header, so none may appear.
+    let Some(server) = boot(openapi_location_spec_path()).await? else {
+        return Ok(());
+    };
+
+    let response = hpx::post(format!("http://{}/sprockets/7", server.http_addr)).send().await?;
+    assert_eq!(response.status().as_u16(), 201);
+    assert!(
+        response.headers().get("location").is_none(),
+        "an undeclared Location header must not be invented"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn invalid_request_returns_400_with_pointer_details() -> Result<(), Box<dyn std::error::Error>>
 {
