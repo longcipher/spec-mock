@@ -1,0 +1,43 @@
+# Scenario sidecar for AsyncAPI channels.
+#
+# A channel is addressed as `channel <name>`, the same catalogue shape the HTTP
+# and gRPC adapters use (`post /widgets`, `unary /pkg.Svc/Method`). A channel
+# carries one message rather than a request and a separate response document, so
+# `keyFrom` reads the identifier out of that message.
+#
+# A WebSocket connection is the session: each connection gets its own instance,
+# chosen with `?scenario=` on the handshake and released when it closes.
+
+version: 1
+
+operations:
+  widgetsCreated:
+    match: { method: channel, path: widgets.created }
+    store:
+      resource: /widgets
+      action: create
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "200": {}
+
+  widgetsFetched:
+    match: { method: channel, path: widgets.fetched }
+    store:
+      resource: /widgets
+      action: read
+      # No identifier appears in a channel address, so the message names it.
+      keyFrom: { in: request, pointer: /id }
+    responses:
+      "200": {}
+
+scenarios:
+  - name: events
+    initialState: listening
+    seed:
+      - resource: /widgets
+        items:
+          - { id: seeded-1, name: Preloaded Widget }
+    states:
+      listening:
+        widgetsCreated: { to: listening }
+        widgetsFetched: {}

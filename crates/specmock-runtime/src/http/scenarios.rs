@@ -343,6 +343,15 @@ impl ScenarioRuntime {
         self.sessions.len()
     }
 
+    /// Drop one instance, used when a WebSocket connection closes.
+    ///
+    /// A connection is the natural scope for a WebSocket session, so its instance
+    /// has to go when the connection does. Left behind, it would keep occupying
+    /// the session cap for the life of the server.
+    pub fn release(&self, scenario: &str, session: &str) -> bool {
+        self.sessions.remove_sync(&(scenario.to_owned(), session.to_owned())).is_some()
+    }
+
     /// Reset every live instance to its initial state and empty its store.
     ///
     /// State and store are reset together and are not separable: a caller able
@@ -388,6 +397,36 @@ impl ScenarioRuntime {
         });
         found.sort();
         found
+    }
+
+    /// Resolve a request that arrived on an AsyncAPI channel.
+    ///
+    /// A channel is addressed as `channel <name>`, so the same catalogue shape
+    /// covers all three protocols: `post /widgets` for HTTP, `unary /pkg.Svc/Method`
+    /// for gRPC, `channel chat.send` for WebSocket.
+    ///
+    /// The payload is used as both the request body and the generated response,
+    /// because a channel carries one message rather than a request and a separate
+    /// response document.
+    pub fn resolve_channel(
+        &self,
+        scenario: &str,
+        session: &str,
+        channel: &str,
+        incoming: Option<&Value>,
+        generated: &Value,
+    ) -> Resolution {
+        self.resolve(
+            Some(scenario),
+            Some(session),
+            "channel",
+            channel,
+            &HashMap::new(),
+            incoming,
+            generated,
+            false,
+            true,
+        )
     }
 
     fn machine(&self, name: &str) -> Option<Scenario> {
@@ -581,9 +620,14 @@ impl ScenarioRuntime {
     }
 }
 
-/// `"METHOD /path"`, the key the catalogue is indexed by.
+/// `"method /path"`, the key the catalogue is indexed by.
+///
+/// The method is lower-cased on both sides so `POST` in a sidecar matches `post`
+/// off the wire, and so a protocol whose "method" is really a kind -- `unary` for
+/// gRPC, `channel` for a WebSocket channel -- reads naturally in a config file
+/// instead of arriving shouted.
 fn request_key(method: &str, path_template: &str) -> String {
-    format!("{} {}", method.to_ascii_uppercase(), path_template)
+    format!("{} {}", method.to_ascii_lowercase(), path_template)
 }
 
 /// Bind a collection path template's parameters, giving the store's namespace.
@@ -615,11 +659,30 @@ fn bind_namespace(template: &str, path_params: &HashMap<String, String>) -> Stri
     bound
 }
 
-/// Resolve the identifier a keyed action addresses from its path parameter.
-fn resolve_key(spec: &StoreSpec, path_params: &HashMap<String, String>) -> Option<String> {
-    let name = spec.key.as_ref()?;
-    let parameter = name.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')).unwrap_or(name);
-    path_params.get(parameter).cloned()
+/// Resolve the identifier a keyed action addresses.
+///
+/// Two sources, because no single one covers every protocol: `key` names a path
+/// parameter, which suits HTTP, and `keyFrom` names a field in the message,
+/// which is the only option for a WebSocket channel or a gRPC method, where
+/// nothing in the address identifies a resource.
+fn resolve_key(
+    spec: &StoreSpec,
+    path_params: &HashMap<String, String>,
+    request_body: Option<&Value>,
+    response_body: &Value,
+) -> Option<String> {
+    if let Some(name) = &spec.key {
+        let parameter =
+            name.strip_prefix('{').and_then(|rest| rest.strip_suffix('}')).unwrap_or(name);
+        if let Some(bound) = path_params.get(parameter) {
+            return Some(bound.clone());
+        }
+    }
+    // A keyed action may still find its resource in the message it was sent.
+    if spec.key_from.is_some() {
+        return resolve_create_key(spec, request_body, response_body);
+    }
+    None
 }
 
 /// Resolve a create's identifier from the pointer it declares.
@@ -676,7 +739,7 @@ fn apply_store(
             .map_err(|error| map_store_error(error, &key));
     }
 
-    let Some(id) = resolve_key(spec, path_params) else {
+    let Some(id) = resolve_key(spec, path_params, request_body, response_body) else {
         return Err(StatefulFailure::ResourceNotFound { key: namespace });
     };
     let key = StoreKey::new(namespace, id);

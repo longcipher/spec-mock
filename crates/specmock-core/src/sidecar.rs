@@ -90,18 +90,16 @@ pub enum SidecarError {
         /// The operation in question.
         operation: String,
     },
-    /// A `create` declares no key source.
-    #[error("operation '{operation}': store action 'create' needs keyFrom")]
-    MissingCreateKey {
+    /// A keyed action declares neither a path parameter nor a message field.
+    ///
+    /// `key` reads a path parameter, which suits HTTP. `keyFrom` reads a field
+    /// out of the message, which is the only option for WebSocket channels and
+    /// gRPC methods, where no identifier appears in the address.
+    #[error("operation '{operation}': store action '{action:?}' needs 'key' or 'keyFrom'")]
+    MissingKey {
         /// The operation in question.
         operation: String,
-    },
-    /// A non-create action declares a key source it cannot use.
-    #[error("operation '{operation}': store action '{action:?}' does not accept keyFrom")]
-    UnexpectedCreateKey {
-        /// The operation in question.
-        operation: String,
-        /// The action that rejected it.
+        /// The action that had no way to find its resource.
         action: StoreAction,
     },
     /// A create's key pointer does not resolve against a generated body.
@@ -426,30 +424,18 @@ fn validate_operation(name: &str, entry: &OperationEntry) -> Result<(), SidecarE
         return Ok(());
     };
 
-    match store.action() {
-        StoreAction::Create => {
-            let Some(source) = &store.key_from else {
-                return Err(SidecarError::MissingCreateKey { operation: name.to_owned() });
-            };
-            if !is_valid_pointer(&source.pointer) {
-                return Err(SidecarError::BadKeyPointer {
-                    operation: name.to_owned(),
-                    pointer: source.pointer.clone(),
-                });
-            }
-        }
-        StoreAction::List => {}
-        StoreAction::Read | StoreAction::Update | StoreAction::Delete => {
-            if store.key_from.is_some() {
-                return Err(SidecarError::UnexpectedCreateKey {
-                    operation: name.to_owned(),
-                    action: store.action(),
-                });
-            }
-            if store.key.is_none() {
-                return Err(SidecarError::MissingCreateKey { operation: name.to_owned() });
-            }
-        }
+    if let Some(source) = &store.key_from &&
+        !is_valid_pointer(&source.pointer)
+    {
+        return Err(SidecarError::BadKeyPointer {
+            operation: name.to_owned(),
+            pointer: source.pointer.clone(),
+        });
+    }
+
+    // `List` addresses a whole namespace, so it needs no identifier.
+    if store.action() != StoreAction::List && store.key.is_none() && store.key_from.is_none() {
+        return Err(SidecarError::MissingKey { operation: name.to_owned(), action: store.action() });
     }
     Ok(())
 }
@@ -629,7 +615,10 @@ mod tests {
         value["scenarios"][0]["states"]["anonymous"]["createUser"] = json!({});
         assert_eq!(
             err(&value),
-            SidecarError::MissingCreateKey { operation: "createUser".to_owned() }
+            SidecarError::MissingKey {
+                operation: "createUser".to_owned(),
+                action: StoreAction::Create,
+            }
         );
     }
 
@@ -655,11 +644,38 @@ mod tests {
     }
 
     #[test]
-    fn a_read_that_declares_key_from_is_rejected() {
+    fn a_read_may_address_its_resource_by_message_field_instead_of_path_parameter() {
+        // WebSocket channels and gRPC methods carry no identifier in the address,
+        // so `keyFrom` is the only way to name a resource for them.
         let mut value = minimal();
-        value["operations"]["readUser"]["store"]["keyFrom"] =
-            json!({ "in": "response", "pointer": "/id" });
-        assert!(matches!(parse(&value), Err(SidecarError::UnexpectedCreateKey { .. })));
+        value["operations"]["readUser"]["store"] = json!({
+            "resource": "/users",
+            "action": "read",
+            "keyFrom": { "in": "request", "pointer": "/id" }
+        });
+        assert!(parse(&value).is_ok(), "a read keyed by message field must be accepted");
+    }
+
+    #[test]
+    fn a_keyed_action_with_neither_key_nor_key_from_is_rejected() {
+        let mut value = minimal();
+        value["operations"]["readUser"]["store"] =
+            json!({ "resource": "/users", "action": "read" });
+        assert_eq!(
+            err(&value),
+            SidecarError::MissingKey {
+                operation: "readUser".to_owned(),
+                action: StoreAction::Read,
+            }
+        );
+    }
+
+    #[test]
+    fn a_list_needs_no_identifier() {
+        let mut value = minimal();
+        value["operations"]["readUser"]["store"] =
+            json!({ "resource": "/users", "action": "list" });
+        assert!(parse(&value).is_ok(), "listing addresses a namespace, not a resource");
     }
 
     #[test]

@@ -875,3 +875,53 @@ async fn a_resource_read_back_is_byte_identical_to_the_one_written()
     server.shutdown().await;
     Ok(())
 }
+
+#[tokio::test]
+async fn the_store_entry_cap_is_reported_rather_than_dropping_resources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let config = ServerConfig { max_store_entries: 2, ..store_config() };
+    let Some(server) = boot(config).await? else {
+        return Ok(());
+    };
+    let base = format!("http://{}", server.http_addr);
+
+    let create = |id: &'static str| {
+        let base = base.clone();
+        async move {
+            let response = hpx::Client::new()
+                .post(format!("{base}/widgets"))
+                .header("Content-Type", "application/json")
+                .body(json!({"id": id, "name": id}).to_string())
+                .send()
+                .await?;
+            read(response).await
+        }
+    };
+
+    // The scenario pre-seeds one widget, so only one create fits under a cap of two.
+    assert_eq!(create("w1").await?.0, 201);
+
+    let (status, _, body) = create("w2").await?;
+    assert_eq!(
+        status, 500,
+        "hitting the cap is the scenario author's problem, reported rather than silently dropped"
+    );
+    assert!(
+        body["detail"].as_str().unwrap_or_default().contains("max-store-entries"),
+        "the error must name the knob to raise: {body}"
+    );
+
+    // Nothing already stored may be evicted to make room.
+    let (_, _, listed) =
+        read(hpx::Client::new().get(format!("{base}/widgets")).send().await?).await?;
+    let ids: Vec<&str> =
+        listed.as_array().expect("array").iter().filter_map(|w| w["id"].as_str()).collect();
+    assert_eq!(
+        ids,
+        ["seeded-1", "w1"],
+        "an eviction-based cap would surface here as a missing resource: {ids:?}"
+    );
+
+    server.shutdown().await;
+    Ok(())
+}

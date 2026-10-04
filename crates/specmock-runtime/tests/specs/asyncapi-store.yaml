@@ -1,0 +1,64 @@
+asyncapi: 2.6.0
+info:
+  title: Widget Events
+  version: "1.0.0"
+channels:
+  widgets.created:
+    publish:
+      message:
+        payload:
+          type: object
+          required: [id, name]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+    subscribe:
+      message:
+        payload:
+          type: object
+          required: [accepted, id]
+          properties:
+            accepted:
+              type: boolean
+            id:
+              type: string
+  widgets.fetched:
+    publish:
+      message:
+        payload:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+    subscribe:
+      message:
+        payload:
+          type: object
+          required: [id, name]
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+  # Deliberately absent from the sidecar, so a scenario that names only some
+  # channels is an additive overlay rather than a replacement.
+  widgets.archived:
+    publish:
+      message:
+        payload:
+          type: object
+          required: [id]
+          properties:
+            id:
+              type: string
+    subscribe:
+      message:
+        payload:
+          type: object
+          required: [archived]
+          properties:
+            archived:
+              type: boolean

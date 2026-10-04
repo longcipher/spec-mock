@@ -48,6 +48,12 @@ pub struct HttpRuntime {
     scenarios: Option<Arc<ScenarioRuntime>>,
     /// Bearer token guarding the control endpoints.
     control_token: Option<String>,
+    /// Monotonic counter behind per-connection WebSocket session keys.
+    ///
+    /// Shared rather than per-clone: `HttpRuntime` is itself shared behind an
+    /// `Arc`, so every clone must draw from the same sequence or two connections
+    /// could be handed the same session key.
+    ws_sessions: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl std::fmt::Debug for HttpRuntime {
@@ -63,6 +69,7 @@ impl std::fmt::Debug for HttpRuntime {
             .field("ws_channel_paths", &self.ws_channel_paths)
             .field("max_body_size", &self.max_body_size)
             .field("scenarios", &self.scenarios)
+            .field("ws_sessions", &self.ws_sessions)
             .field("control_token", &self.control_token.as_ref().map(|_| "[redacted]"))
             .finish_non_exhaustive()
     }
@@ -73,6 +80,17 @@ impl HttpRuntime {
     #[must_use]
     pub fn scenarios(&self) -> Option<&ScenarioRuntime> {
         self.scenarios.as_deref()
+    }
+
+    /// Mint a session key for one WebSocket connection.
+    ///
+    /// WebSocket has no request-scoped addressing, so each connection is given
+    /// its own instance. The counter is per-server, which is enough because a
+    /// connection's session is released when it closes.
+    #[must_use]
+    pub fn fresh_ws_session(&self) -> String {
+        let index = self.ws_sessions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("ws-{index}")
     }
 
     /// A shared handle to the scenario runtime, for callers outside this crate.
@@ -169,6 +187,7 @@ impl HttpRuntime {
             client: hpx::Client::new(),
             scenarios,
             control_token: config.control_token.clone(),
+            ws_sessions: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 }
