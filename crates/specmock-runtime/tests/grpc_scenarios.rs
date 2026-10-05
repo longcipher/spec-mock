@@ -250,7 +250,7 @@ async fn sessions_isolate_stores_across_calls() -> Result<(), Box<dyn std::error
     let Some(addr) = server.grpc_addr else {
         return Ok(());
     };
-    let mut create = |session: &'static str| -> tonic::Request<CreateRequest> {
+    let create = |session: &'static str| -> tonic::Request<CreateRequest> {
         let mut request = tonic::Request::new(CreateRequest {
             id: "shared".to_owned(),
             name: "Shared".to_owned(),
