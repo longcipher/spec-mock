@@ -311,6 +311,18 @@ impl MockServerBuilder {
             command.arg("--allow-private-upstream");
         }
         command.arg("--max-body-size").arg(self.config.max_body_size.to_string());
+        command.arg("--max-sessions").arg(self.config.max_sessions.to_string());
+        command.arg("--max-store-entries").arg(self.config.max_store_entries.to_string());
+
+        if let Some(path) = &self.config.scenarios_spec {
+            command.arg("--scenarios").arg(path);
+        }
+
+        if self.config.control_token.is_none() {
+            command.arg("--no-control-endpoints");
+        }
+
+        command.arg("--log-level").arg("info");
 
         let mut child = command.spawn()?;
 

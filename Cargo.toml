@@ -1,5 +1,5 @@
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/longcipher/spec-mock"
@@ -19,9 +19,9 @@ resolver = "3"
 
 [workspace.dependencies]
 # local crates
-specmock-core = { path = "crates/specmock-core", version = "0.1.0" }
-specmock-runtime = { path = "crates/specmock-runtime", version = "0.1.0" }
-specmock-sdk = { path = "crates/specmock-sdk", version = "0.1.0" }
+specmock-core = { path = "crates/specmock-core", version = "0.1.2" }
+specmock-runtime = { path = "crates/specmock-runtime", version = "0.1.2" }
+specmock-sdk = { path = "crates/specmock-sdk", version = "0.1.2" }
 
 # external crates
 axum = "0.8.9"
@@ -30,28 +30,28 @@ bytes = "1.12.1"
 clap = "4.6.7"
 eyre = "0.6.14"
 futures-util = "0.3.34"
-hpx = "2.5.28"
+hpx = "2.5.31"
 http = "1.5.0"
 http-body = "1.1.0"
 http-body-util = "0.1.5"
-hyper = "1.11.1"
+hyper = "1.12.0"
 hyper-util = "0.1.21"
-jsonschema = "0.58.4"
-proptest = "1.11.0"
+jsonschema = "0.58.6"
+proptest = "1.12.0"
 prost = "0.14.4"
 prost-reflect = "0.16.5"
-protox = "0.9.1"
+protox = "0.10.0"
 rand = "0.10.3"
 rand_chacha = "0.10.0"
 rand_regex = "0.19.0"
 regex-lite = "0.1.9"
 scc = "3.8.8"
 serde = "1.0.229"
-serde_json = "1.0.151"
+serde_json = "1.0.154"
 serde_yml = "0.0.13"
 tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = "1.53.1"
+tokio = "1.53.3"
 tokio-tungstenite = "0.30.0"
 tonic = "0.14.6"
 tower = "0.5.3"

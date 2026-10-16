@@ -683,11 +683,22 @@ fn sanitize_error_message(msg: &str) -> String {
 }
 
 fn is_valid_callback_url(url: &str) -> bool {
-    // ponytail: SSRF guard — reject non-http(s) schemes
-    matches!(
-        url::Url::parse(url).map(|u| u.scheme().to_owned()),
-        Ok(scheme) if scheme == "http" || scheme == "https"
-    )
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return false;
+    }
+    if let Some(host) = parsed.host_str() &&
+        let Ok(ip) = host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>() &&
+        crate::is_private_ip(ip)
+    {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]

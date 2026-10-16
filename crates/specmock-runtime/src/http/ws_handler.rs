@@ -223,8 +223,11 @@ async fn ws_socket_loop(
     }
 
     // Release the connection's instance so it stops occupying the session cap.
-    if let (Some(scenarios), Some(scenario)) = (&runtime.scenarios, &scenario_name) {
-        scenarios.release(scenario, &session);
+    if let Some(scenarios) = &runtime.scenarios {
+        let scenario = scenario_name.clone().or_else(|| scenarios.default_scenario_name().map(ToOwned::to_owned));
+        if let Some(scenario) = scenario {
+            scenarios.release(&scenario, &session);
+        }
     }
 }
 

@@ -255,13 +255,13 @@ impl tower::Service<http::Request<hyper::body::Incoming>> for DynamicGrpcService
                         }
                     }
                 }
-                // A response declared with a status and no body means "fail with
-                // this code". Over gRPC the declared key *is* the gRPC status
-                // code, so it passes through rather than being mapped from HTTP.
+                // A scenario response override uses an HTTP status key, so map it
+                // to the nearest gRPC code instead of returning it raw (raw values
+                // above 16 are not valid gRPC status codes).
                 Some(crate::http::scenarios::Resolution::Forced { status, .. }) => {
                     return Ok(grpc_error_response(
-                        i32::from(status),
-                        &format!("scenario declared gRPC status {status}"),
+                        grpc_code_for(status),
+                        &format!("scenario declared status {status}"),
                         None,
                     ));
                 }
@@ -313,12 +313,20 @@ fn grpc_directives(headers: &http::HeaderMap) -> GrpcDirectives {
 /// state is `FAILED_PRECONDITION`, a missing resource is `NOT_FOUND`, and a
 /// store that is full is an internal condition rather than the client's fault.
 fn grpc_code_for(status: u16) -> i32 {
+    if status <= 16 {
+        return i32::from(status);
+    }
     match status {
-        404 => 5, // NOT_FOUND
-        409 => 9, // FAILED_PRECONDITION
-        429 => 8, // RESOURCE_EXHAUSTED
-        401 => 7, // PERMISSION_DENIED
-        _ => 13,  // INTERNAL
+        400 | 422 => 3, // INVALID_ARGUMENT
+        401 => 16,       // UNAUTHENTICATED
+        403 => 7,       // PERMISSION_DENIED
+        404 => 5,       // NOT_FOUND
+        409 => 6,       // ALREADY_EXISTS
+        429 => 8,       // RESOURCE_EXHAUSTED
+        501 => 12,      // UNIMPLEMENTED
+        503 => 14,      // UNAVAILABLE
+        504 => 4,       // DEADLINE_EXCEEDED
+        _ => 13,        // INTERNAL
     }
 }
 

@@ -452,17 +452,15 @@ fn collect_warnings(sidecar: &Sidecar) -> Vec<SidecarWarning> {
                         operations
                             .iter()
                             .map(|(operation, step)| {
-                                (
-                                    operation.clone(),
-                                    step.target.as_ref().map_or_else(
+                                let mut transition = step
+                                    .target
+                                    .as_ref()
+                                    .map_or_else(
                                         crate::scenario::Transition::stay,
-                                        |target| {
-                                            crate::scenario::Transition::to(State::new(
-                                                target.clone(),
-                                            ))
-                                        },
-                                    ),
-                                )
+                                        |target| crate::scenario::Transition::to(State::new(target.clone())),
+                                    );
+                                transition.responses = step.responses.clone();
+                                (operation.clone(), transition)
                             })
                             .collect(),
                     )

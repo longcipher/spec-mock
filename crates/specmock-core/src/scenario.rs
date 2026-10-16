@@ -14,6 +14,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::sidecar::ResponseOverride;
+
 /// A named position within a scenario.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct State(String);
@@ -48,19 +50,26 @@ impl std::fmt::Display for State {
 pub struct Transition {
     /// State to move to, or `None` to stay put.
     pub target: Option<State>,
+    /// Status-keyed response overrides for this transition.
+    ///
+    /// Carried here so the state machine owns the behaviour it governs instead
+    /// of the runtime re-reading the sidecar. Sidecar loading is expected to
+    /// populate this from the matching `StepEntry`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub responses: std::collections::BTreeMap<String, ResponseOverride>,
 }
 
 impl Transition {
     /// Build a transition that moves to `target`.
     #[must_use]
     pub fn to(target: State) -> Self {
-        Self { target: Some(target) }
+        Self { target: Some(target), responses: std::collections::BTreeMap::new() }
     }
 
     /// Build a transition that stays in the current state.
     #[must_use]
     pub fn stay() -> Self {
-        Self { target: None }
+        Self { target: None, responses: std::collections::BTreeMap::new() }
     }
 }
 

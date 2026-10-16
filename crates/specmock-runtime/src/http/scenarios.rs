@@ -481,12 +481,14 @@ impl ScenarioRuntime {
                         operations
                             .iter()
                             .map(|(operation, step)| {
-                                (
-                                    operation.clone(),
-                                    step.target.as_ref().map_or_else(Transition::stay, |target| {
+                                let mut transition = step
+                                    .target
+                                    .as_ref()
+                                    .map_or_else(Transition::stay, |target| {
                                         Transition::to(State::new(target.clone()))
-                                    }),
-                                )
+                                    });
+                                transition.responses = step.responses.clone();
+                                (operation.clone(), transition)
                             })
                             .collect(),
                     )
@@ -613,7 +615,7 @@ impl ScenarioRuntime {
         // declares `responses: {"200": {}}` purely to say which status an
         // operation returns, and that must not erase a body the store supplied.
         if !matches!(outcome, Resolution::Failed(_) | Resolution::Forced { .. }) {
-            let state_override = self.step_responses(machine.name(), &state, &operation.name);
+            let state_override = self.step_responses(&machine, &state, &operation.name);
             let chosen = state_override.iter().next().or_else(|| operation.responses.iter().next());
 
             if let Some((declared_status, spec)) = chosen {
@@ -638,20 +640,17 @@ impl ScenarioRuntime {
 
     /// The response overrides a scenario declares for one operation in one state.
     ///
-    /// This is how fault injection is expressed: a state that declares an error
-    /// response is a state the flow can be driven into, rather than a separate
-    /// mechanism bolted beside the state machine (ADR 0001).
+    /// Read from the FSM's transition so response behaviour lives in the same
+    /// place as the state move, rather than being re-read from the sidecar.
     fn step_responses(
         &self,
-        scenario: &str,
+        machine: &Scenario,
         state: &State,
         operation: &str,
     ) -> BTreeMap<String, ResponseOverride> {
-        self.sidecar
-            .scenario(scenario)
-            .and_then(|entry| entry.states.get(state.name()))
-            .and_then(|operations| operations.get(operation))
-            .map(|step| step.responses.clone())
+        machine
+            .transition(state, operation)
+            .map(|transition| transition.responses.clone())
             .unwrap_or_default()
     }
 

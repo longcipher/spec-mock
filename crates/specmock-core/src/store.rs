@@ -19,6 +19,7 @@
 
 use scc::HashMap;
 use serde_json::Value;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Namespace and identifier of a stored resource.
 ///
@@ -93,13 +94,15 @@ pub struct Store {
     /// Insertion order of identifiers per namespace.
     order: HashMap<String, Vec<String>>,
     limit: usize,
+    /// Live entry count, atomically maintained alongside `entries`.
+    count: AtomicUsize,
 }
 
 impl Store {
     /// Build a store bounded to `limit` entries across all namespaces.
     #[must_use]
     pub fn new(limit: usize) -> Self {
-        Self { entries: HashMap::new(), order: HashMap::new(), limit }
+        Self { entries: HashMap::new(), order: HashMap::new(), limit, count: AtomicUsize::new(0) }
     }
 
     /// Store a new resource, failing if the key is taken or the store is full.
@@ -108,12 +111,23 @@ impl Store {
     /// creates for one key cannot both succeed. The capacity check is
     /// necessarily advisory: it can be overtaken by a racing create.
     pub fn create(&self, key: &StoreKey, value: Value) -> Result<(), StoreError> {
-        if self.entries.len() >= self.limit {
-            return Err(StoreError::CapacityExceeded { limit: self.limit });
+        // Atomically reserve a slot before touching the maps, so concurrent
+        // creates cannot both pass the capacity check and overshoot the cap.
+        loop {
+            let current = self.count.load(Ordering::Acquire);
+            if current >= self.limit {
+                return Err(StoreError::CapacityExceeded { limit: self.limit });
+            }
+            if self.count.compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                break;
+            }
         }
+
         // `insert_sync` fails if the key is already present, which makes the
         // collision check and the write a single atomic step.
         if self.entries.insert_sync(key.clone(), value).is_err() {
+            // Release the slot we reserved; the collision is not a stored entry.
+            self.count.fetch_sub(1, Ordering::AcqRel);
             return Err(StoreError::AlreadyExists(key.clone()));
         }
         // `update_sync` only touches an existing key, so the namespace's
@@ -153,6 +167,7 @@ impl Store {
             .remove_sync(key)
             .map(|_| ())
             .ok_or_else(|| StoreError::NotFound(key.clone()))?;
+        self.count.fetch_sub(1, Ordering::AcqRel);
         let namespace = key.namespace.clone();
         let id = key.id.clone();
         self.order.update_sync(&namespace, |_, ids| ids.retain(|existing| existing != &id));
@@ -182,7 +197,7 @@ impl Store {
     /// Number of stored resources across all namespaces.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.count.load(Ordering::Acquire)
     }
 
     /// Whether the store holds no resources.
@@ -202,9 +217,10 @@ impl Store {
     /// Clearing the data and the ordering index together keeps a reset from
     /// leaving a namespace listing identifiers that no longer resolve.
     pub fn clear(&self) -> usize {
-        let removed = self.entries.len();
+        let removed = self.count.load(Ordering::Acquire);
         self.entries.clear_sync();
         self.order.clear_sync();
+        self.count.store(0, Ordering::Release);
         removed
     }
 }
