@@ -2,17 +2,20 @@
 default:
   @just --list
 
-# Format all code
+# Format markdown, TOML and Rust sources
 format:
   rumdl fmt .
   taplo fmt
   cargo +nightly fmt --all
 
-# Auto-fix linting issues
+# Auto-fix what `format` cannot: markdown lints
 fix:
   rumdl check --fix .
 
-# Run all lints
+# TOML is formatted with `taplo`, not `cargo sort`: CI installs taplo-cli and
+# `.taplo.toml` owns the dependency-key ordering for this workspace.
+#
+# Run all lints (every tool used here is installed by .github/workflows/ci.yml)
 lint:
   typos
   rumdl check .
@@ -21,7 +24,7 @@ lint:
   cargo +nightly clippy --all -- -D warnings
   cargo machete
 
-# Run tests
+# Run the workspace test suite
 test:
   cargo test --all-features
 
@@ -37,12 +40,12 @@ test-unit:
 test-integration:
   cargo test --workspace --tests
 
-# Run tests with coverage
-#
 # `cargo llvm-cov` is used rather than `cargo tarpaulin`: tarpaulin's bundled
 # profdata parser rejects the profiles emitted by current nightly rustc
 # ("consistency check for reading counts failed"), while llvm-cov shells out to
 # the toolchain's own llvm-profdata and stays in step with it.
+#
+# Run tests with coverage
 test-coverage:
   cargo llvm-cov --all-features --workspace --summary-only
 
@@ -108,13 +111,27 @@ check:
 publish-check:
   cargo publish --workspace --dry-run --allow-dirty
 
-# Publish all crates to crates.io
+# Publish all crates to crates.io (irreversible: run only with a registry token)
 publish:
   cargo publish --workspace
 
-# Check for Chinese characters
+# `faker.rs`, `http/media.rs` and `grpc/protobuf.rs` carry CJK test data for
+# IRI and Unicode handling, and `specs/` is a historical plan archive.
+#
+# Fail if Chinese characters are present in tracked files
 check-cn:
-  rg --line-number --column "\p{Han}"
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if rg --line-number --column "\p{Han}" \
+      --glob '!specs/**' \
+      --glob '!crates/specmock-core/src/faker.rs' \
+      --glob '!crates/specmock-runtime/src/http/media.rs' \
+      --glob '!crates/specmock-runtime/src/grpc/protobuf.rs' \
+      . ; then
+    echo "error: Chinese characters found" >&2
+    exit 1
+  fi
+  echo "ok: no Chinese characters found"
 
 # Full CI check
 ci: lint test build
@@ -135,10 +152,36 @@ setup:
   cargo install cargo-machete
   cargo install taplo-cli
   cargo install typos-cli
+  cargo install rumdl
   cargo install cargo-nextest
   cargo install cargo-fuzz
   cargo install cargo-llvm-cov
+  cargo install cargo-audit
+  cargo install cargo-outdated
 
 # Generate documentation for the workspace
 docs:
   cargo doc --no-deps --open
+
+# Run security audit
+audit:
+  cargo audit
+
+# Check for outdated dependencies
+outdated:
+  cargo outdated
+
+# Run clippy with all lints
+clippy-all:
+  cargo +nightly clippy --all-targets --all-features -- -W clippy::pedantic -W clippy::nursery -W clippy::cargo
+
+# Check for unused dependencies
+unused-deps:
+  cargo machete
+
+# Update all dependencies
+update-deps:
+  cargo update
+
+# Full check (lint + test + build + audit)
+full-check: lint test build audit
